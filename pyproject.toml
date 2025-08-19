@@ -17,16 +17,18 @@ classifiers = [
 # We ship a package under src/mlserver_parallel
 packages = [
   { include = "woprserver", from = "src" },
-  { include = "benchmarking"}
 ]
 
 [tool.poetry.scripts]
 WOPRserver = "woprserver.cli:main"
 
 [tool.poetry.dependencies]
-python = ">=3.10,<4.0"
+python = ">=3.10,<3.13"
 mlserver = ">=1.2,<2.0"
 langchain = "^0.3.27"
+mlserver-sklearn = "^1.7.1"
+mlflow = "^3.2.0"
+mlserver-mlflow = "^1.7.1"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -72,7 +74,6 @@ httpx-sse = ">=0.3.1,<0.5.0"
 psutil = "^7.0.0"
 prometheus-client = "^0.22.1"
 grpcio = "^1.74.0"
-mlflow = {extras = ["genai"], version = "^3.2.0"}
 langchain-core = "^0.3.74"
 ruff = {extras = ["format"], version = "^0.12.9"}
 [build-system]
