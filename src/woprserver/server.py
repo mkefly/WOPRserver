@@ -6,11 +6,8 @@ from typing import Optional, List
 
 from mlserver.repository.factory import ModelRepositoryFactory
 
-from mlserver.model import MLModel
-from mlserver.settings import Settings, ModelSettings
-from mlserver.registry import MultiModelRegistry
+from mlserver.settings import Settings
 from mlserver.handlers import DataPlane, ModelRepositoryHandlers
-from mlserver.batching import load_batching
 from mlserver.metrics import MetricsServer
 from mlserver.kafka import KafkaServer
 from mlserver.server import MLServer
