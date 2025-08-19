@@ -6,17 +6,19 @@ import os
 import random
 import time
 from collections.abc import AsyncIterator, Iterable
+from typing import Union, Optional
 
 from mlserver import MLModel, types
-from woprserver.logging import get_logger 
+from woprserver.logging import get_logger
+
 logger = get_logger()
 
-
-# ---------------------------
+# =============================================================================
 # Tunables (override via env)
-# ---------------------------
-TOKENS_PER_CHUNK = int(os.getenv("TOKENS_PER_CHUNK", "36"))  # 20–40 is reasonable
-TIMESLICE_MS = int(os.getenv("TIMESLICE_MS", "90"))          # 50–100ms typical
+# =============================================================================
+
+TOKENS_PER_CHUNK = int(os.getenv("TOKENS_PER_CHUNK", "36"))  # ~20–40 is reasonable
+TIMESLICE_MS = int(os.getenv("TIMESLICE_MS", "90"))          # ~50–100 ms typical
 
 MIN_TOKENS = int(os.getenv("MIN_TOKENS", "400"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1600"))
@@ -34,16 +36,20 @@ SENTENCE_MAX_WORDS = 22
 PARA_MIN_SENTENCES = 2
 PARA_MAX_SENTENCES = 6
 
-# ---------------------------
-# Helpers
-# ---------------------------
 
-def _seed_from_request(req_id: str | None, prompt: str) -> int:
+# =============================================================================
+# Helpers
+# =============================================================================
+
+ByteLike = Union[bytes, bytearray, memoryview]
+
+
+def _seed_from_request(req_id: Optional[str], prompt: str) -> int:
     """Deterministic per request + prompt."""
     h = hashlib.blake2b(digest_size=8)
-    h.update((req_id or "none").encode())
+    h.update((req_id or "none").encode("utf-8"))
     h.update(b"|")
-    h.update(prompt.encode())
+    h.update(prompt.encode("utf-8"))
     return int.from_bytes(h.digest(), "big")
 
 
@@ -73,7 +79,6 @@ def _title_case(words: list[str]) -> str:
 
 
 def _choose_heading(prompt_words: list[str], rng: random.Random) -> str:
-    # prefer prompt words; fall back to base vocab
     picks = prompt_words or _base_vocab()
     length = rng.randint(2, 5)
     return _title_case([rng.choice(picks) for _ in range(length)])
@@ -93,10 +98,8 @@ def _word_sampler(prompt: str, rng: random.Random) -> Iterable[str]:
         "as a result", "meanwhile", "in parallel", "on the other hand",
     ]
     while True:
-        # occasional connective
         if rng.random() < 0.06:
             yield rng.choice(connectors)
-        # default: choose a topic word
         yield rng.choice(vocab)
 
 
@@ -153,31 +156,70 @@ def _now_ms() -> float:
 def _join_and_cleanup(chunks: list[str]) -> str:
     text = " ".join(chunks)
     # small fixes to spacing/punctuation
-    text = (
+    return (
         text.replace(" ,", ",")
-        .replace(" .", ".")
-        .replace(" !", "!")
-        .replace(" ?", "?")
+            .replace(" .", ".")
+            .replace(" !", "!")
+            .replace(" ?", "?")
     )
-    return text
 
 
-# ---------------------------
+# ============================ IO: decode/encode ==============================
+
+def _decode_first_cell(req: types.InferenceRequest) -> str:
+    """
+    Return the first input element as a *text* string.
+    Handles bytes/bytearray/memoryview safely; falls back to str().
+    """
+    if not getattr(req, "inputs", None):
+        return ""
+    first = req.inputs[0]
+    data = getattr(first, "data", None)
+    if not data:
+        return ""
+    # mlserver supports both "list-like" or TensorData(root=[...])
+    try:
+        # TensorData
+        root = data.root  # type: ignore[attr-defined]
+        x = root[0] if root else b""
+    except AttributeError:
+        # Plain list-like
+        x = data[0]
+    if isinstance(x, (bytes, bytearray, memoryview)):
+        return bytes(x).decode("utf-8", errors="replace")
+    return str(x)
+
+
+def _to_bytes(s: str) -> bytes:
+    return s.encode("utf-8", errors="strict")
+
+
+def _make_text_output_bytes(name: str, payload: str, headers: dict[str, str]) -> types.ResponseOutput:
+    return types.ResponseOutput(
+        name=name,
+        shape=[1],
+        datatype="BYTES",
+        data=types.TensorData(root=[_to_bytes(payload)]),
+        parameters=types.Parameters(headers=headers),
+    )
+
+
+# =============================================================================
 # Model
-# ---------------------------
+# =============================================================================
 
 class ToyLLM(MLModel):
     """
     A toy model that streams long but readable prose with sections and lists.
     It coalesces tokens by count and by time slice to keep SSE event rate low.
 
-    This rewritten version is robust to MLServer delivering *batches* to
-    `predict_stream` or `predict`. It gracefully accepts any of:
+    Robust to MLServer delivering *batches* to predict/predict_stream.
+    Accepts:
       - a single `types.InferenceRequest`
       - a list/tuple of `types.InferenceRequest`
       - a (sync) iterator of `types.InferenceRequest`
       - an async iterator of `types.InferenceRequest`
-    and uses the first request as the driver of the response.
+    Uses the first request as the driver of the response.
     """
 
     # --- helpers for request handling -------------------------------------
@@ -218,14 +260,14 @@ class ToyLLM(MLModel):
         raise TypeError("Unsupported payload type for predict/predict_stream")
 
     def _get_prompt(self, req: types.InferenceRequest) -> str:
-        return str(req.inputs[0].data[0]) if req.inputs and req.inputs[0].data else ""
+        return _decode_first_cell(req)
 
     async def _generate_stream(
         self,
         prompt: str,
         min_tokens: int = MIN_TOKENS,
         max_tokens: int = MAX_TOKENS,
-        req_id: str | None = None,
+        req_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Yields *semantic* chunks (paras, bullet blocks, headings), not single tokens.
@@ -281,6 +323,7 @@ class ToyLLM(MLModel):
     # ------------------------------------------------------------------
     # Inference APIs
     # ------------------------------------------------------------------
+
     async def predict_stream(self, payload):
         """
         Streaming response with coalescing:
@@ -306,7 +349,7 @@ class ToyLLM(MLModel):
             # Rough word-based “token” proxy
             return sum(len(p.split()) for p in buffer)
 
-        async def _flush():
+        async def _flush() -> Optional[types.InferenceResponse]:
             nonlocal buffer, chunk_idx, last_emit
             if not buffer:
                 return None
@@ -314,24 +357,21 @@ class ToyLLM(MLModel):
             buffer.clear()
             last_emit = _now_ms()
             chunk_idx += 1
+
+            out = _make_text_output_bytes(
+                name="text",
+                payload=text,
+                headers={
+                    "X-Worker-PID": pid,
+                    "X-Chunk-Index": str(chunk_idx),
+                    "X-Coalesce": f"{TOKENS_PER_CHUNK}/{TIMESLICE_MS}ms",
+                },
+            )
             return types.InferenceResponse(
                 id=req.id,
                 model_name=self.name,
-                outputs=[
-                    types.ResponseOutput(
-                        name="text",
-                        shape=[1],
-                        datatype="BYTES",
-                        data=[text],
-                        parameters=types.Parameters(
-                            headers={
-                                "X-Worker-PID": pid,
-                                "X-Chunk-Index": str(chunk_idx),
-                                "X-Coalesce": f"{TOKENS_PER_CHUNK}/{TIMESLICE_MS}ms",
-                            }
-                        ),
-                    )
-                ],
+                outputs=[out],
+                parameters=types.Parameters(headers={"Ce-Endpoint": "llm"}),
             )
 
         try:
@@ -368,16 +408,15 @@ class ToyLLM(MLModel):
         text = _join_and_cleanup(
             [chunk async for chunk in self._generate_stream(prompt, req_id=req.id)]
         )
+
+        out = _make_text_output_bytes(
+            name="text",
+            payload=text,
+            headers={"X-Worker-PID": pid},
+        )
         return types.InferenceResponse(
             id=req.id,
             model_name=self.name,
-            outputs=[
-                types.ResponseOutput(
-                    name="text",
-                    shape=[1],
-                    datatype="BYTES",
-                    data=[text],
-                    parameters=types.Parameters(headers={"X-Worker-PID": pid}),
-                )
-            ],
+            outputs=[out],
+            parameters=types.Parameters(headers={"Ce-Endpoint": "llm"}),
         )

@@ -76,6 +76,10 @@ prometheus-client = "^0.22.1"
 grpcio = "^1.74.0"
 langchain-core = "^0.3.74"
 ruff = {extras = ["format"], version = "^0.12.9"}
+locust = "^2.38.1"
+protobuf = "^6.32.0"
+requests = "^2.32.5"
+sseclient-py = "^1.8.0"
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"

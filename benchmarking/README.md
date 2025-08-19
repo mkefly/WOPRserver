@@ -1,118 +1,85 @@
-Here’s an updated `README.md` that reflects the switch from `Makefile` targets to the new **Click-based Python CLI** (`cli.py`), while keeping all the original context:
+# Locust MLServer Bench (Python translation of k6 setup)
 
-````markdown
-# Benchmarking
+This is a Python/Locust translation of your k6 benchmarks (REST & gRPC, unary & streaming, plus a Prometheus poller).
 
-This folder contains a set of tools to benchmark the gRPC and REST APIs of
-`mlserver`.  
-These load tests are run locally against a local server.
-
-## Current results
-
-|      | Requests/sec | Average (ms) | Slowest (ms) | Fastest (ms) |
-| ---- | ------------ | ------------ | ------------ | ------------ |
-| gRPC | 2259         | 128.46       | 703.84       | 3.09         |
-| REST | 1300         | 226.93       | 304.98       | 2.06         |
-
-## Setup
-
-The benchmark scenarios in this folder leverage [`k6`](https://k6.io/).  
-To install `k6`, please check their [installation docs page](https://k6.io/docs/getting-started/installation/).
-
-You also need **Click** (already in this repo).  
+## Install
 
 ```bash
-pip install click
-````
-
-## Data
-
-You can find pre-generated requests under the [`/data`](./data) folder.
-
-### Generate
-
-You can re-generate the test requests by using the
-[`generator.py`](./generator.py) script directly, or via the CLI:
-
-```bash
-# direct
-python generator.py
-
-# via cli.py
-python cli.py generate
+python -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+pip install -r requirements.txt
 ```
 
-## Usage
+## Required environment
 
-We provide a Python CLI (`cli.py`) that replaces the old `make` targets.
-It offers consistent commands for server lifecycle, data generation, and all benchmarks.
-
-### Server lifecycle
+Set these before running (matching your k6 setup):
 
 ```bash
-# start MLServer with local test models
-python cli.py start
-
-# stop it
-python cli.py stop
-
-# restart
-python cli.py restart
+export MLSERVER_HOST=127.0.0.1
+export MLSERVER_HTTP_PORT=8080
+# If metrics are served on another port:
+export MLSERVER_METRICS_PORT=8080
+# For gRPC:
+export MLSERVER_GRPC_PORT=8081
+# For proto resolution (absolute path is best):
+export MLSERVER_PROTO=proto/dataplane.proto
 ```
 
-### Inference benchmarks
-
-Run unary inference benchmarks (REST or gRPC) against a **Scikit-Learn model trained on the Iris dataset**:
-
-```bash
-python cli.py bench-rest
-python cli.py bench-grpc
+You should also have the JSON payloads under `data/` mirroring your k6 repo:
+```
+data/
+  iris/
+    rest-requests.json
+    grpc-requests.json
+  llm/
+    rest-requests.json
+    grpc-requests.json
+    rest-requests-many.json   # optional array
+    grpc-requests-many.json   # optional array
+  summodel/
+    rest-requests.json
+    grpc-requests.json
+    rest-requests-many.json   # optional
+    grpc-requests-many.json   # optional
 ```
 
-Each benchmark lasts 60s. The model is configured to use **adaptive batching**.
+> The gRPC client compiles the proto at runtime into a temp folder using `grpcio-tools`. Make sure `MLSERVER_PROTO` points to a readable file. If unset, it will attempt to find `benchmarking/proto/dataplane.proto` or `proto/dataplane.proto` **relative** to this project.
 
-### Streaming benchmarks
+## Running scenarios
 
-We also provide benchmarks for both **server-sent events (REST)** and **gRPC streaming**
-against two toy models (`summodel` and `llm`):
+Each scenario is its own file under `scenarios/`. Run them independently to mirror your k6 setup.
 
+### REST streaming (summodel + llm) + Prometheus poller
 ```bash
-# REST streaming
-python cli.py stream-rest
-
-# gRPC streaming
-python cli.py stream-grpc
-
-# both
-python cli.py stream-all
+locust -f scenarios/streaming_rest.py --headless -u 61 -r 61 -t 60s
+# spawns: 40 summodel streams, 20 llm streams, 1 Prom poller
 ```
 
-### Multi-model scenario
-
-To simulate loading and querying multiple models:
-
+### REST unary (iris)
 ```bash
-python cli.py mms
+locust -f scenarios/inference_rest.py --headless -u 300 -r 300 -t 60s
+```
+(Equivalent thresholds: expect `http_2xx` rate to be high; Locust doesn't enforce thresholds by default.)
+
+### gRPC unary (iris)
+```bash
+locust -f scenarios/inference_grpc.py --headless -u 300 -r 300 -t 60s
 ```
 
----
-
-### Environment overrides
-
-All commands accept overrides via flags or environment variables:
-
+### gRPC streaming (summodel + llm) + Prometheus poller
 ```bash
-# override via env
-MLSERVER_HOST=localhost MLSERVER_HTTP_PORT=9090 python cli.py bench-rest
-
-# override via flags
-python cli.py --mlserver-host localhost --http-port 9090 --grpc-port 9091 bench-grpc
+locust -f scenarios/streaming_grpc.py --headless -u 61 -r 61 -t 60s
+# spawns: 40 summodel, 20 llm, 1 poller
 ```
 
-# Benchmarking — notes
-
-### SSE with k6
-k6 needs an extension to handle SSE:
+### Multi-model (MMS) loader
 ```bash
-go install go.k6.io/xk6/cmd/xk6@latest
-xk6 build v0.51.0 --with github.com/grafana/xk6-sse@latest -o k6
+locust -f scenarios/mms.py --headless -u 2 -r 2 --iterations 10
+```
+
+## Notes
+
+- Custom metrics are recorded using Locust's `events.request.fire` with synthetic names (e.g., `metric/worker_proc_cpu_pct`). The "response time" field stores the metric value for aggregation (avg, p95, max).
+- SSE uses `sseclient-py` on top of Locust's `requests` session.
+- gRPC uses runtime `protoc` compilation of `dataplane.proto`. If compilation fails, the error will explain how to point to the proto path.
+- The Prometheus poller parses a few metrics from MLServer's `/metrics`, similar to your k6 regex helpers.
