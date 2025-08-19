@@ -1,0 +1,49 @@
+{
+  "rest": [
+    {
+      "id": "9d73690c-9225-4d30-a06f-0a42ade7f658",
+      "inputs": [
+        {
+          "name": "prompt",
+          "shape": [
+            1
+          ],
+          "datatype": "BYTES",
+          "data": [
+            "Tell me a story about space travel."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "d975d734-8f8c-445f-9be7-3b599387de4a",
+      "inputs": [
+        {
+          "name": "prompt",
+          "shape": [
+            1
+          ],
+          "datatype": "BYTES",
+          "data": [
+            "Explain quantum mechanics to a child."
+          ]
+        }
+      ]
+    },
+    {
+      "id": "3cd85cca-be1b-44af-9384-7f14ec5559e8",
+      "inputs": [
+        {
+          "name": "prompt",
+          "shape": [
+            1
+          ],
+          "datatype": "BYTES",
+          "data": [
+            "Write a short poem about benchmarking."
+          ]
+        }
+      ]
+    }
+  ]
+}

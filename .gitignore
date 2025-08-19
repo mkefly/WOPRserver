@@ -1,0 +1,74 @@
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.pyc
+bin
+*.db
+
+benchmarking/k6
+
+*.metrics
+*.envs
+*.grpc_gen
+
+# Mac file system
+**/.DS_Store
+
+# editor and IDE paraphernalia
+.idea
+.vscode
+.project
+*.swp
+*.swo
+*~
+.env
+*.cache
+
+# Python dev
+.mypy_cache
+eggs/
+.eggs/
+*.egg-info/
+./pytest_cache
+.tox
+build/
+dist/
+venv/
+.venv/
+
+# Notebook Checkpoints
+.ipynb_checkpoints
+
+# Benchmarking and profiling
+benchmarking/profiles/
+benchmarking/testserver/models/iris-*
+benchmarking/testserver/models/sum-model-*
+*.prof
+
+# Bundle folders
+_bundle
+
+# Conda-packed environment
+old-sklearn.tar.gz
+mlruns
+dataset
+lightning_logs
+
+# Runtime: CatBoost
+catboost_info/
+
+# Sphinx documentation
+docs/_build/
+
+# Tests cache folders
+**/tests/testdata/.cache/**
+## The .data path is longer used, but let's keep the line to avoid people
+## pushing their old .data folder by mistake
+runtimes/alibi-explain/tests/.data/**
+
+# Docker metadata
+.docker/

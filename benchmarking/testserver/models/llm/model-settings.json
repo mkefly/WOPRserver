@@ -1,0 +1,30 @@
+{
+  "name": "llm",
+
+  "implementation": "models.llm.model.ToyLLM",
+
+  "max_batch_size": 1,
+  "max_batch_time": 0.0,
+
+  "versions": ["llm/v0"],
+  "platform": "mlserver",
+
+  "inputs": [
+    {
+      "datatype": "BYTES",
+      "name": "text",
+      "shape": [1]
+    }
+  ],
+  "outputs": [
+    {
+      "datatype": "BYTES",
+      "name": "text",
+      "shape": [1]
+    }
+  ],
+
+  "parameters": {
+    "version": "v0"
+  }
+}

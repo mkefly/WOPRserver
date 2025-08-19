@@ -1,0 +1,1 @@
+{"id": "c67e3d6c-ac80-4d47-b355-ae5b0b685bba", "inputs": [{"name": "text", "shape": [1], "datatype": "BYTES", "data": ["Summarize streaming inference versus unary inference in one paragraph."]}]}

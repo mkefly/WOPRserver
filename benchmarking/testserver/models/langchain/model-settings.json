@@ -1,0 +1,26 @@
+{
+  "name": "langchain",
+  "implementation": "woprserver.replicants.langchain.LangChainRuntime",
+  "platform": "mlserver",
+  "versions": ["langchain/v0"],
+  "max_batch_size": 1,
+  "max_batch_time": 0.0,
+  "inputs": [
+    {
+      "name": "text",
+      "datatype": "BYTES",
+      "shape": [1]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "datatype": "BYTES",
+      "shape": [1]
+    }
+  ],
+  "parameters": {
+    "version": "v0",
+    "mlflow_model_uri": "models/langchain/MLmodel"
+  }
+}

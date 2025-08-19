@@ -1,0 +1,1 @@
+{"modelName": "llm", "modelVersion": "v0", "id": "c67e3d6c-ac80-4d47-b355-ae5b0b685bba", "inputs": [{"name": "text", "datatype": "BYTES", "shape": ["1"], "contents": {"bytesContents": ["U3VtbWFyaXplIHN0cmVhbWluZyBpbmZlcmVuY2UgdmVyc3VzIHVuYXJ5IGluZmVyZW5jZSBpbiBvbmUgcGFyYWdyYXBoLg=="]}}]}

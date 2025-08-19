@@ -1,0 +1,29 @@
+{
+  "name": "summodel",
+
+  "implementation": "models.summodel.model.SumModel",
+
+  "max_batch_size": 200,
+  "max_batch_time": 0.2,
+
+  "versions": ["summodel/v1.2.3"],
+  "platform": "mlserver",
+  "inputs": [
+    {
+      "datatype": "FP32",
+      "name": "input-0",
+      "shape": [128]
+    }
+  ],
+  "outputs": [
+    {
+      "datatype": "FP32",
+      "name": "output-0",
+      "shape": [1]
+    }
+  ],
+
+  "parameters": {
+    "version": "v1.2.3"
+  }
+}

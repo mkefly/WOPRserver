@@ -1,0 +1,25 @@
+flavors:
+  langchain:
+    code: null
+    langchain_version: 0.3.27
+    model_data: model.pkl
+    model_load: runnable_load
+    model_type: AgentSmithDummyChat
+    streamable: true
+  python_function:
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.langchain
+    model_data: model.pkl
+    model_load: runnable_load
+    model_type: AgentSmithDummyChat
+    predict_stream_fn: predict_stream
+    python_version: 3.11.3
+    streamable: true
+mlflow_version: 3.2.0
+model_id: null
+model_size_bytes: 25172
+model_uuid: c20f0f141e484eeb87f2dbf5d765b10e
+prompts: null
+utc_time_created: '2025-08-17 17:15:19.994050'

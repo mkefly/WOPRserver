@@ -1,0 +1,8 @@
+{
+  "debug": false,
+  "load_models_at_startup": true, 
+  "parallel_workers": 6,
+  "metrics_endpoint": "/metrics",
+  "metrics_port": 8082,
+  "server_name": "WOPRserver" 
+}

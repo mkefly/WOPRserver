@@ -1,0 +1,10 @@
+mlflow==3.2.0
+brotli==1.1.0
+cloudpickle==3.1.1
+langchain==0.3.27
+opentelemetry-exporter-otlp-proto-grpc==1.36.0
+opentelemetry-instrumentation-fastapi==0.57b0
+opentelemetry-instrumentation-grpc==0.57b0
+psutil==7.0.0
+pydantic==2.11.7
+pygments==2.19.2
