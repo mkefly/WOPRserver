@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Mapping, Any
+from collections.abc import Mapping
+from typing import Any
+
 
 class ModelAdapter(logging.LoggerAdapter):
     """Injects model_name/model_version/environment into all log calls."""

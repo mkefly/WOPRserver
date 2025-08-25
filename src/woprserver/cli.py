@@ -2,21 +2,20 @@
 Command-line interface to manage WOPRserver models.
 """
 
-import click
 import asyncio
-
 from functools import wraps
 
+import click
+from mlserver.batch_processing import CHOICES_TRANSPORT, process_batch
+from mlserver.cli.build import build_image, generate_dockerfile, write_dockerfile
 from mlserver.cli.init_project import init_cookiecutter_project
-
+from mlserver.cli.serve import load_settings
 from mlserver.utils import install_uvloop_event_loop
 
-from mlserver.cli.build import generate_dockerfile, build_image, write_dockerfile
-from mlserver.cli.serve import load_settings
-from mlserver.batch_processing import process_batch, CHOICES_TRANSPORT
-from .logging import setup_once  # <-- add this import
+from .logging import get_logger, setup_once  # <-- add this import
 from .server import WOPRserver
 
+logger = get_logger()
 
 def click_async(f):
     @wraps(f)

@@ -4,9 +4,9 @@ import asyncio
 import os
 import signal
 import time
+from collections import Counter as RefCounter
 from contextlib import suppress
 from typing import Optional
-from collections import Counter as RefCounter
 
 from mlserver.env import Environment, compute_hash_of_file, compute_hash_of_string
 from mlserver.model import MLModel
@@ -14,8 +14,8 @@ from mlserver.registry import model_initialiser
 from mlserver.settings import ModelSettings, Settings
 from mlserver.utils import to_absolute_path
 
-from .errors import EnvironmentNotFound
 from ..logging import get_logger
+from .errors import EnvironmentNotFound
 from .pool import InferencePool, InferencePoolHook
 
 logger = get_logger()

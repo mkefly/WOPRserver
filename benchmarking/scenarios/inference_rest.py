@@ -1,6 +1,8 @@
-from locust import HttpUser, task, between, events
-import json, os, time
+import json
+import os
+
 from common.helpers import read_test_data
+from locust import HttpUser, between, events, task
 
 # Config (mirror k6)
 SCENARIO_DURATION = "60s"  # for docs
@@ -45,11 +47,13 @@ class RestIrisUser(HttpUser):
                 try:
                     rss = float(headers["X-Proc-RSS-KB"])
                     events.request.fire(request_type="metric", name="unary_worker_proc_rss_kb", response_time=rss, response_length=0, context={"worker": pid}, exception=None)
-                except Exception: pass
+                except Exception:
+                    pass
             if "X-Proc-CPU-Pct" in headers:
                 try:
                     cpu = float(headers["X-Proc-CPU-Pct"])
                     events.request.fire(request_type="metric", name="unary_worker_proc_cpu_pct", response_time=cpu, response_length=0, context={"worker": pid}, exception=None)
-                except Exception: pass
+                except Exception:
+                    pass
             # Distinct workers seen per-request (will usually be 1 for unary)
             events.request.fire(request_type="metric", name="unary_workers_seen_local", response_time=1.0, response_length=0, context={"workers": 1}, exception=None)

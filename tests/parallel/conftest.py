@@ -1,9 +1,6 @@
 # in tests/parallel/conftest.py
 from __future__ import annotations
 
-import os, time, contextlib
-from pathlib import Path
-from filelock import FileLock, Timeout
 import asyncio
 import contextlib
 import glob
@@ -18,7 +15,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
-import pytest, asyncio, uvloop
+
+import pytest
+import uvloop
+from filelock import FileLock, Timeout
 
 from woprserver.server import WOPRserver
 
@@ -28,15 +28,11 @@ try:
 except RuntimeError:
     pass
 
+import subprocess
+
 import prometheus_client
-import pytest
 import pytest_asyncio
 import yaml
-from filelock import FileLock, Timeout
-from prometheus_client.registry import REGISTRY as PROM_DEFAULT_REGISTRY
-from prometheus_client.registry import CollectorRegistry
-from starlette_exporter import PrometheusMiddleware
-
 from mlserver import types
 from mlserver.codecs.string import StringCodec
 from mlserver.env import Environment
@@ -53,9 +49,11 @@ from mlserver.repository import (
 from mlserver.rest import RESTServer
 from mlserver.settings import ModelParameters, ModelSettings, Settings
 from mlserver.types import InferenceRequest, InferenceResponse, MetadataModelResponse
+from prometheus_client.registry import REGISTRY as PROM_DEFAULT_REGISTRY
+from prometheus_client.registry import CollectorRegistry
+from starlette_exporter import PrometheusMiddleware
 
 from woprserver.logging import get_logger
-from woprserver.parallel.registry import InferencePoolRegistry
 from woprserver.parallel.dispatcher import Dispatcher
 from woprserver.parallel.messages import (
     ModelRequestMessage,
@@ -64,12 +62,9 @@ from woprserver.parallel.messages import (
 )
 from woprserver.parallel.model import ModelMethods, ParallelModel
 from woprserver.parallel.pool import InferencePool, _spawn_worker
+from woprserver.parallel.registry import InferencePoolRegistry
 from woprserver.parallel.utils import cancel_task, configure_inference_pool
 from woprserver.parallel.worker import Worker
-
-import subprocess
-import yaml
-from pathlib import Path
 
 # Import only model classes from fixtures; DO NOT re-declare root fixtures here.
 from .fixtures import (
@@ -272,7 +267,7 @@ def _acquire_tarball_lock_with_ttl(
                 raise TimeoutError(
                     f"Timed out waiting for {lock_path} (waited {waited:.0f}s, age {age:.0f}s, size {size}B, pid {pid}). "
                     "If no packer is running, remove the .lock and any partial tarball."
-                )
+                ) from None
 
             logger.info("Waiting on lock %s ... age=%.1fs ttl=%.1fs (held by PID %s?)", lock_path, age, ttl, pid)
 
@@ -295,7 +290,7 @@ def _export_poetry_requirements(cache_dir: str, with_dev: bool = True) -> Path:
 
 def _env_yml_abs_editable(cache_dir: str) -> str:
     repo_root = Path(__file__).resolve().parents[2]
-    req_file = _export_poetry_requirements(cache_dir, with_dev=True)
+    _ = _export_poetry_requirements(cache_dir, with_dev=True)
     env_spec = {
         "name": "custom-runtime-environment",
         "channels": ["defaults"],
@@ -539,7 +534,6 @@ async def mlserver(
     prometheus_registry: CollectorRegistry,  # force init
 ):
     """Boot an MLServer instance for integration tests."""
-    from woprserver.server import WOPRserver
 
     server = WOPRserver(_woprserver_settings)
     task = asyncio.create_task(server.start())

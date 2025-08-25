@@ -1,9 +1,12 @@
 # common/grpc_client.py
 import os
+
 import grpc
 from google.protobuf import json_format
+
 from common import dataplane_pb2 as pb2
 from common import dataplane_pb2_grpc as pb2_grpc
+
 
 class GrpcClient:
     def __init__(self, host=None, port=None, options=None, insecure=True, creds=None):

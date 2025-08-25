@@ -1,5 +1,6 @@
 import re
-from typing import Optional, Dict
+from typing import Dict, Optional
+
 
 def escape_re(s: str) -> str:
     return re.escape(s)
@@ -18,7 +19,7 @@ def count_active_workers(body: str) -> Optional[int]:
     if not body:
         return None
     active = 0
-    for pid, val in re.findall(r'^worker_active_streams\{[^}]*pid="([^"]+)"[^}]*\}\s+([0-9eE+\-.]+)\s*$', body, re.M):
+    for _, val in re.findall(r'^worker_active_streams\{[^}]*pid="([^"]+)"[^}]*\}\s+([0-9eE+\-.]+)\s*$', body, re.M):
         try:
             v = float(val)
             if v > 0:

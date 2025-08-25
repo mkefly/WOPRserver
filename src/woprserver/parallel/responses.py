@@ -13,17 +13,16 @@ from typing import Any
 from prometheus_client import REGISTRY as PROM_REGISTRY
 from prometheus_client import Gauge, Histogram
 
+from ..logging import get_logger
 from .errors import WorkerStop
-from ..logging import get_logger 
-logger = get_logger()
-
 from .messages import (
     Message,
     ModelResponseMessage,
 )
-from .worker import Worker  # for runtime type
+from .worker import Worker
 
 QUEUE_METRIC_NAME = "parallel_request_queue_size"
+logger = get_logger()
 
 
 class AsyncResponses:

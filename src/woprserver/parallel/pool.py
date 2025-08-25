@@ -57,12 +57,11 @@ made.
 
 from __future__ import annotations
 
-import os
-
-import signal
 import asyncio
+import os
+import signal
 from collections.abc import Awaitable, Callable, Iterable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from multiprocessing import Queue
 from typing import Optional
 
@@ -71,17 +70,16 @@ from mlserver.model import MLModel
 from mlserver.settings import ModelSettings, Settings
 from mlserver.types import InferenceRequest, InferenceResponse
 
+from ..logging import get_logger
 from .dispatcher import Dispatcher
-from ..logging import get_logger 
 from .messages import (
     ModelResponseMessage,
     ModelUpdateMessage,
     ModelUpdateType,
 )
 from .model import ParallelModel
-from .utils import configure_inference_pool, terminate_queue, make_queue
+from .utils import configure_inference_pool, make_queue, terminate_queue
 from .worker import Worker
-from contextlib import suppress
 
 logger = get_logger()
 

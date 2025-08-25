@@ -1,6 +1,7 @@
 import os
-import json
+
 import requests
+
 
 class RestClient:
     def __init__(self, host=None, http_port=None, metrics_port=None):

@@ -62,9 +62,7 @@ from typing import Any
 
 from mlserver.utils import generate_uuid, schedule_with_callback
 
-from ..logging import get_logger 
-logger = get_logger()
-
+from ..logging import get_logger
 from .messages import (
     ModelRequestMessage,
     ModelResponseMessage,
@@ -78,7 +76,7 @@ from .responses import AsyncResponses
 from .utils import END_OF_QUEUE, cancel_task
 from .worker import Worker  # for runtime type
 
-
+logger = get_logger()
 class Dispatcher:
     """Fan‑out requests to workers; fan‑in responses back to callers.
 

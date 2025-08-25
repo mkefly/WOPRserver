@@ -1,9 +1,12 @@
 
 from __future__ import annotations
+
 import logging
-from .formatting import WoprFormatter
-from .utils import NameRewriteFilter, DeDupeFilter, supports_color
+
 from .config import LoggingConfig
+from .formatting import WoprFormatter
+from .utils import DeDupeFilter, NameRewriteFilter, supports_color
+
 
 def create_root_handler(cfg: LoggingConfig) -> logging.Handler:
     use_color = supports_color() if cfg.use_color is None else bool(cfg.use_color)

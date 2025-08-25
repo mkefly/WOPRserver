@@ -1,10 +1,18 @@
-from locust import HttpUser, task, between, events
-import time, os, json, random
-from sseclient import SSEClient
+import json
+import os
+import random
+import time
+
 from common.helpers import read_test_data
 from common.prom_utils import (
-    count_active_workers, count_distinct_workers, sum_inference_pools, parse_prom_metric, parse_rest_stream_requests
+    count_active_workers,
+    count_distinct_workers,
+    parse_prom_metric,
+    parse_rest_stream_requests,
+    sum_inference_pools,
 )
+from locust import HttpUser, between, events, task
+from sseclient import SSEClient
 
 TestData = {
     "summodel": read_test_data("summodel"),
@@ -75,12 +83,14 @@ class RestStreamUserBase(HttpUser):
                         rss = float(headers.get("X-Proc-RSS-KB", "nan"))
                         if rss == rss:  # not NaN
                             events.request.fire(request_type="metric", name="worker_proc_rss_kb", response_time=rss, response_length=0, context={"worker": pid}, exception=None)
-                    except Exception: pass
+                    except Exception:
+                        pass
                     try:
                         cpu = float(headers.get("X-Proc-CPU-Pct", "nan"))
                         if cpu == cpu:
                             events.request.fire(request_type="metric", name="worker_proc_cpu_pct", response_time=cpu, response_length=0, context={"worker": pid}, exception=None)
-                    except Exception: pass
+                    except Exception:
+                        pass
 
         dur_ms = (time.time() - t0) * 1000.0
         events.request.fire(request_type="metric", name="sse_total_duration_ms", response_time=dur_ms, response_length=0, exception=None)

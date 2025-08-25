@@ -1,6 +1,7 @@
-from locust import HttpUser, task, between
 import os
+
 from common.helpers import read_test_data
+from locust import HttpUser, between, task
 
 ModelCount = 10  # use --iterations 10
 

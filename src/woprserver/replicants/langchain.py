@@ -16,7 +16,6 @@ from mlflow.version import VERSION
 from mlserver import types
 from mlserver.errors import InferenceError
 from mlserver.handlers import custom_handler
-from ..logging import get_logger 
 from mlserver.model import MLModel
 from mlserver.settings import ModelParameters
 from mlserver.types import InferenceRequest, InferenceResponse
@@ -30,6 +29,8 @@ from mlserver_mlflow.metadata import (
     to_metadata_tensors,
     to_model_content_type,
 )
+
+from ..logging import get_logger
 
 # Shared IO helpers
 from .shared.io import (

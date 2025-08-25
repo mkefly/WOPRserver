@@ -1,7 +1,9 @@
 
 from __future__ import annotations
+
 import logging
 import os
+
 
 def neutralize_mlserver() -> None:
     try:
@@ -37,5 +39,7 @@ def neutralize_mlflow() -> None:
         lg = logging.getLogger(n)
         lg.propagate = True
         for h in list(lg.handlers):
-            try: lg.removeHandler(h)
-            except Exception: pass
+            try: 
+                lg.removeHandler(h)
+            except Exception: 
+                pass

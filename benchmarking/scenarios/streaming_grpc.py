@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import os
-import time
 import random
-from typing import Any, Optional, Iterable, Callable
+import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-
-from locust import User, task, between, events
+from typing import Any, Callable, Optional
 
 from common.grpc_client import GrpcClient
 from common.helpers import read_test_data
-
+from locust import User, between, events, task
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config (override via env)
@@ -152,8 +151,6 @@ class GrpcStreamLLMUser(User):
     def stream_llm(self) -> None:
         data = TEST_DATA[DATASET_KEY]
         payload = pick_payload(data)
-
-        start = time.time()
 
         # Callbacks emitting Locust metrics (safe from threads)
         def on_first(msg: Any, t_first_s: float) -> None:

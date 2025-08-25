@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import logging
-import time
 import re
+import time
 from dataclasses import dataclass
-from typing import Protocol, Dict, Optional, Callable, List, Tuple
+from typing import Callable, ClassVar, List, Optional, Protocol, Tuple
 
 from .utils import supports_color, supports_unicode
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Color Strategy
@@ -21,9 +20,8 @@ class NoColorStrategy:
     def color(self, text: str, role: str) -> str:
         return text
 
-
 class AnsiColorStrategy:
-    COLORS: Dict[str, str] = {
+    COLORS: ClassVar[dict[str, str]] = {
         "reset": "\x1b[0m",
         "dim": "\x1b[38;5;244m",
         "name": "\x1b[38;5;177m",
@@ -40,13 +38,13 @@ class AnsiColorStrategy:
         "meth": "\x1b[38;5;178m",
         "model":"\x1b[38;5;141m",
         "ts":   "\x1b[38;5;244m",
-
         # banner cosmetics
         "banner_line_warn": "\x1b[38;5;214m",
         "banner_line_err":  "\x1b[38;5;196m",
         "banner_label_warn":"\x1b[38;5;214m",
         "banner_label_err": "\x1b[38;5;196m",
     }
+
 
     def color(self, text: str, role: str) -> str:
         c = self.COLORS.get(role, "")
@@ -225,7 +223,7 @@ class TracebackHighlighter:
         if not ctx.use_color:
             return text
 
-        def _file_sub(m: "re.Match[str]") -> str:
+        def _file_sub(m: re.Match[str]) -> str:
             return ''.join([
                 m.group(1),
                 ctx.colors.color(m.group(2), "file"),
@@ -240,10 +238,12 @@ class TracebackHighlighter:
             if TracebackHighlighter.file_re.match(line):
                 line = TracebackHighlighter.file_re.sub(_file_sub, line)
             elif TracebackHighlighter.exc_re.match(line):
-                g = TracebackHighlighter.exc_re.match(line); assert g is not None
+                g = TracebackHighlighter.exc_re.match(line)
+                assert g is not None
                 line = ctx.colors.color(g.group(1), "exc") + (g.group(2) or "")
             elif TracebackHighlighter.code_re.match(line):
-                g = TracebackHighlighter.code_re.match(line); assert g is not None
+                g = TracebackHighlighter.code_re.match(line)
+                assert g is not None
                 line = g.group(1) + ctx.colors.color(g.group(2), "code")
             out.append(line)
         return "\n".join(out)

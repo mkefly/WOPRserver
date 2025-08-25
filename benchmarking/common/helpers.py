@@ -1,10 +1,10 @@
 import json
-import os
 from pathlib import Path
+
 
 def _read_json(path):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None

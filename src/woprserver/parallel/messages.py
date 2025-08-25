@@ -43,9 +43,9 @@ from asyncio import CancelledError
 from enum import IntEnum
 from typing import Any
 
+from mlserver.settings import ModelSettings
 from mlserver.utils import generate_uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-
 
 # ---- Enums -----------------------------------------------------------------
 
@@ -151,7 +151,6 @@ class ModelUpdateMessage(Message):
         serialize it to a compact JSON string and stash it under
         ``serialised_model_settings``.
         """
-        from mlserver.settings import ModelSettings  # lazy to avoid heavy imports at module load
 
         if not isinstance(data, dict):
             return data
@@ -193,7 +192,7 @@ class ModelUpdateMessage(Message):
         return ModelSettings.model_validate(json.loads(self.serialised_model_settings))  # type: ignore[arg-type]
 
     @classmethod
-    def from_model_settings(cls, update_type: ModelUpdateType, model_settings: "ModelSettings") -> "ModelUpdateMessage":
+    def from_model_settings(cls, update_type: ModelUpdateType, model_settings: ModelSettings) -> "ModelUpdateMessage":
         """Convenience constructor for callers holding a concrete settings object."""
         return cls(update_type=update_type, model_settings=model_settings)
 

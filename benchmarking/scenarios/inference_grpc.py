@@ -1,8 +1,8 @@
-from locust import User, task, between, events
-import os, random, time
-from common.helpers import read_test_data
+import time
+
 from common.grpc_client import GrpcClient
-from google.protobuf import json_format
+from common.helpers import read_test_data
+from locust import User, between, events, task
 
 SCENARIO_DURATION = "60s"
 SCENARIO_VUS = 300

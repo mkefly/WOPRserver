@@ -1,20 +1,16 @@
-import asyncio
 import signal
-import logging
 
-from typing import Optional, List
-
-from mlserver.repository.factory import ModelRepositoryFactory
-
-from mlserver.settings import Settings
 from mlserver.handlers import DataPlane, ModelRepositoryHandlers
-from mlserver.metrics import MetricsServer
 from mlserver.kafka import KafkaServer
+from mlserver.metrics import MetricsServer
+from mlserver.repository.factory import ModelRepositoryFactory
 from mlserver.server import MLServer
+from mlserver.settings import Settings
+
+from .grpc.server import GRPCServer
 from .logging import configure_logger
 from .parallel.registry import InferencePoolRegistry
 from .rest.server import WRESTServer
-from .grpc.server import GRPCServer
 
 HANDLED_SIGNALS = [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT]
 

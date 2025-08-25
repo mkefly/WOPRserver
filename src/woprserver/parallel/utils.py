@@ -2,11 +2,12 @@ import asyncio
 import multiprocessing as mp
 from asyncio import Task
 from multiprocessing import Queue
-
-from mlserver.settings import Settings
 from multiprocessing.context import BaseContext
 
-from ..logging import get_logger 
+from mlserver.settings import Settings
+
+from ..logging import get_logger
+
 logger = get_logger()
 
 

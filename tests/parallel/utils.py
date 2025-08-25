@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shlex
 import shutil
 import socket
 import time
-import contextlib
 from asyncio import subprocess
-from itertools import filterfalse
 from string import Template
 from typing import Optional
 
@@ -21,9 +20,9 @@ from aiohttp.client_exceptions import (
     ServerDisconnectedError,
 )
 from aiohttp_retry import ExponentialRetry, RetryClient
-
 from mlserver.types import InferenceRequest, InferenceResponse, RepositoryIndexResponse
 from mlserver.utils import generate_uuid
+
 from woprserver.logging import get_logger
 
 logger = get_logger()
@@ -202,7 +201,10 @@ async def _pack(version: tuple[int, int], env_yml: str, tarball_path: str) -> No
             await _run_streaming(pack_cmd, env=env_vars)
         else:
             run_prefix = ["micromamba", "run", "-n", env_name]
-            await _run_streaming(run_prefix + ["python", "-m", "conda_pack", *pack_common], env=env_vars)
+            await _run_streaming(
+                [*run_prefix, "python", "-m", "conda_pack", *pack_common],
+                env=env_vars,
+            )
 
         elapsed = time.time() - t0
         logger.info("Packed environment to %s (%.1fs)", tarball_path, elapsed)

@@ -1,8 +1,10 @@
 
 from __future__ import annotations
+
 import logging
 
 from .utils import map_ns
+
 
 def install_hard_router() -> None:
     if getattr(install_hard_router, "_installed", False):
@@ -25,7 +27,7 @@ def install_hard_router() -> None:
             return _orig_callHandlers(self, record)
 
         try:
-            setattr(record, "_wopr_forced", True)
+            record._wopr_forced = True
             root.handle(record)
         finally:
             try:

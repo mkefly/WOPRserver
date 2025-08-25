@@ -1,8 +1,3 @@
-# Strict Worker (no implicit coercion)
-# - Removes _coerce_to_inference_response
-# - Enforces that predict() returns an InferenceResponse (non-streaming)
-# - Keeps streaming, input-channel bridging, metrics, and graceful shutdown
-
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +17,8 @@ from dataclasses import dataclass
 from multiprocessing import Process, Queue
 from typing import TYPE_CHECKING, Any, Optional
 
+from mlserver import types
+
 from ..logging import configure_logger, get_logger
 from .errors import WorkerError
 from .messages import (
@@ -40,7 +37,6 @@ from .utils import END_OF_QUEUE, make_queue, terminate_queue
 if TYPE_CHECKING:
     from mlserver.env import Environment
     from mlserver.settings import Settings
-    from mlserver.types import InferenceResponse  # for isinstance checks / annotations
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -295,7 +291,7 @@ def _should_decode_request(method: Any, args: list[Any]) -> bool:
         return False
 
 def _decode_request_args_for(
-    method: Any, request: "InferenceRequest", model: Any
+    method: Any, request: types.InferenceRequest, model: Any
 ) -> tuple[list[Any], dict[str, Any]]:
     """
     Version-agnostic decoder:
@@ -337,7 +333,7 @@ def _decode_request_args_for(
             except StopIteration:
                 raise WorkerError(
                     ValueError("Not enough inputs to satisfy method parameters")
-                )
+                ) from None
             decoded[i] = model.decode(inputs[idx])
 
     return decoded, {}
@@ -489,7 +485,7 @@ class Worker(Process):
     # ---------------------------- lifecycle ---------------------------------
 
     def __init__(
-        self, settings: "Settings", responses: Queue, env: Optional["Environment"] = None
+        self, settings: Settings, responses: Queue, env: Optional[Environment] = None
     ):
         """
         Initialize the worker process with internal request/update queues.
@@ -523,11 +519,11 @@ class Worker(Process):
     def run(self) -> None:
         """
         Process entrypoint:
-          - Activate env context (if provided)
-          - Sanitize sys.version for strict platform parsers
-          - Install uvloop
-          - Configure logging and metrics
-          - Enter the async main routine
+        - Activate env context (if provided)
+        - Sanitize sys.version for strict platform parsers
+        - Install uvloop
+        - Configure logging and metrics
+        - Enter the async main routine
         """
         ctx = self._env or nullcontext()
         with ctx:
@@ -538,7 +534,8 @@ class Worker(Process):
             try:
                 from mlserver.utils import install_uvloop_event_loop
             except Exception:
-                install_uvloop_event_loop = lambda: None  # type: ignore
+                def install_uvloop_event_loop() -> None:
+                    pass
 
             install_uvloop_event_loop()
             configure_logger(self._settings)

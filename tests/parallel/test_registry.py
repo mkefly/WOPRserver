@@ -1,31 +1,28 @@
 from __future__ import annotations
 
-import os
-import uuid
 import asyncio
+import uuid
 from copy import deepcopy
 from typing import Optional
 from unittest.mock import patch
 
 import pytest
-
+from mlserver.codecs import StringCodec
 from mlserver.env import Environment, compute_hash_of_file
 from mlserver.model import MLModel
-from mlserver.settings import Settings, ModelSettings, ModelParameters
+from mlserver.settings import ModelParameters, ModelSettings, Settings
 from mlserver.types import InferenceRequest
-from mlserver.codecs import StringCodec
 
 from woprserver.parallel.errors import EnvironmentNotFound
 from woprserver.parallel.registry import (
-    InferencePoolRegistry,
-    _set_environment_hash,
-    _get_environment_hash,
-    _append_gid_environment_hash,
     ENV_HASH_ATTR,
+    InferencePoolRegistry,
+    _append_gid_environment_hash,
+    _get_environment_hash,
+    _set_environment_hash,
 )
 
-from .fixtures import SumModel, EnvModel
-
+from .fixtures import EnvModel, SumModel
 
 # --------------------------------------------------------------------------------------
 # Helpers

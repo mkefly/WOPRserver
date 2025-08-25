@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Dict, Union
+
 
 def supports_color() -> bool:
     if os.getenv("NO_COLOR"):

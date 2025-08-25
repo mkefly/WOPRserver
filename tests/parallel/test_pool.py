@@ -8,16 +8,15 @@ from typing import Any
 import numpy as np
 import pytest
 from mlserver.codecs import NumpyCodec, StringCodec
-from mlserver.errors import MLServerError
 from mlserver.model import MLModel
 from mlserver.settings import ModelSettings, Settings
-from mlserver.types import InferenceRequest, InferenceResponse
+from mlserver.types import InferenceRequest
 
+from woprserver.parallel.errors import WorkerError
 from woprserver.parallel.pool import InferencePool
 from woprserver.parallel.utils import configure_inference_pool
-from woprserver.parallel.errors import WorkerError
 
-from .fixtures import ErrorModel, PidStreamModel, PidUnaryModel, SumModel
+from .fixtures import PidStreamModel, PidUnaryModel, SumModel
 
 # Tight overall deadlines, but avoid wrapping every single await with wait_for.
 # We retry quickly on transient CancelledError/None-response while the dispatcher restarts.

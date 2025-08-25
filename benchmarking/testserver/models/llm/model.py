@@ -6,9 +6,10 @@ import os
 import random
 import time
 from collections.abc import AsyncIterator, Iterable
-from typing import Union, Optional
+from typing import Optional, Union
 
 from mlserver import MLModel, types
+
 from woprserver.logging import get_logger
 
 logger = get_logger()
@@ -244,7 +245,9 @@ class ToyLLM(MLModel):
             try:
                 return next(iterator)
             except StopIteration:
-                raise ValueError("Empty iterator for predict/predict_stream")
+                raise ValueError(
+                    "Empty iterator for predict/predict_stream"
+                ) from None
 
         # Async iterator
         try:
@@ -255,7 +258,9 @@ class ToyLLM(MLModel):
             try:
                 return await aiter.__anext__()    # type: ignore[attr-defined]
             except StopAsyncIteration:
-                raise ValueError("Empty async iterator for predict/predict_stream")
+                raise ValueError(
+                    "Empty async iterator for predict/predict_stream"
+                ) from None
 
         raise TypeError("Unsupported payload type for predict/predict_stream")
 

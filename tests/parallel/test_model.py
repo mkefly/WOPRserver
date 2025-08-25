@@ -20,6 +20,7 @@ from .fixtures import (
     _ServerAsyncGen,
 )
 
+
 @pytest.mark.asyncio
 async def test_predict_returns_inference_response(pm_and_dispatcher, mocker):
     pm, dispatcher, _ = pm_and_dispatcher

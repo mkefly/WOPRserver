@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Tuple
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 from .utils import map_ns
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Context registry (single source of truth for contextvars)

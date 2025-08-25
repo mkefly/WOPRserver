@@ -36,12 +36,12 @@ import asyncio
 import inspect
 import itertools
 from collections.abc import AsyncIterable as CAsyncIterable
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from collections.abc import AsyncIterator as CAsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
-from typing import Any, get_origin, AsyncIterator
+from typing import Any, get_origin
 
 from mlserver.errors import InferenceError
 from mlserver.handlers.custom import get_custom_handlers, register_custom_handler

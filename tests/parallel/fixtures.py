@@ -5,12 +5,16 @@ import asyncio
 import os
 import random
 import string
+
+# tests/conftest.py
+import warnings
 from collections.abc import AsyncIterator
 from typing import Annotated, Optional
 
 import numpy as np
+import psutil
+import pytest
 from fastapi import Body
-
 from mlserver.codecs import NumpyCodec, StringCodec
 from mlserver.errors import MLServerError
 from mlserver.handlers.custom import custom_handler
@@ -25,11 +29,6 @@ from mlserver.types import (
     ResponseOutput,
 )
 from mlserver.utils import generate_uuid
-# tests/conftest.py
-import os
-import warnings
-import psutil
-import pytest
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -50,6 +49,7 @@ def warn_if_micromamba_hanging():
             + ", ".join(f"pid={p.pid}" for p in hanging_procs)
             + " — tests that pack/unpack environments may hang until they are killed.",
             RuntimeWarning,
+            stacklevel=2,
         )
 
     # Also check for stale lock files in ~/.mamba/pkgs/locks
@@ -61,6 +61,7 @@ def warn_if_micromamba_hanging():
                 f"Stale micromamba lock files detected in {lock_dir}: {locks}. "
                 "Tests may hang until these are cleaned up.",
                 RuntimeWarning,
+                stacklevel=2,
             )
 
     yield
@@ -146,7 +147,7 @@ class ErrorModel(MLModel):
 
 
 class SimpleModel(MLModel):
-    async def predict(self, foo: np.ndarray, bar: list[str]) -> InferenceResponse:  # noqa: ARG002
+    async def predict(self, foo: np.ndarray, bar: list[str]) -> InferenceResponse:
         
         output = NumpyCodec.encode_output(name="total", payload=foo.sum(axis=1, keepdims=True))
         response = InferenceResponse(
@@ -211,7 +212,7 @@ class PidUnaryModel(MLModel):
     async def metadata(self) -> MetadataModelResponse:
         return MetadataModelResponse(name=self.settings.name, platform="test")
 
-    async def predict(self, payload: InferenceRequest) -> InferenceResponse:  # noqa: ARG002
+    async def predict(self, payload: InferenceRequest) -> InferenceResponse:
         return InferenceResponse(
             model_name=self.settings.name,
             outputs=[StringCodec.encode_output(name="output", payload=[str(os.getpid())], use_bytes=False)],
@@ -222,7 +223,7 @@ class PidStreamModel(MLModel):
     async def load(self) -> bool:
         return True
 
-    async def predict_stream(self, payloads: Optional[AsyncIterator[InferenceRequest]] = None) -> AsyncIterator[InferenceResponse]:  # noqa: ARG002
+    async def predict_stream(self, payloads: Optional[AsyncIterator[InferenceRequest]] = None) -> AsyncIterator[InferenceResponse]:
         pid = str(os.getpid())
         await asyncio.sleep(0)  # give the loop a tick
         yield InferenceResponse(model_name=self.settings.name, outputs=[StringCodec.encode_output("output", [pid], use_bytes=True)])

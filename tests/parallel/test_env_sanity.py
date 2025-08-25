@@ -1,39 +1,34 @@
 from __future__ import annotations
 
-import sys
-import os
-import time
-import tarfile
-import subprocess
 import asyncio
+import contextlib
 import multiprocessing as mp
-from pathlib import Path
+import os
+import subprocess
+import sys
+import tarfile
+import time
 from contextlib import contextmanager
-from queue import Empty
 from multiprocessing import spawn as mp_spawn  # has get_executable() on 3.10+
+from pathlib import Path
+from queue import Empty
 
 import pytest
-
-from mlserver.env import Environment
-from mlserver.settings import ModelSettings, ModelParameters, Settings
-from mlserver.types import InferenceRequest, InferenceResponse
 from mlserver.codecs import StringCodec
+from mlserver.env import Environment
+from mlserver.settings import ModelParameters, ModelSettings, Settings
+from mlserver.types import InferenceRequest, InferenceResponse
 
-from woprserver.parallel.worker import Worker
 from woprserver.parallel.messages import (
-    ModelUpdateMessage,
-    ModelUpdateType,
     ModelRequestMessage,
     ModelResponseMessage,
+    ModelUpdateMessage,
+    ModelUpdateType,
 )
 from woprserver.parallel.model import ModelMethods
+from woprserver.parallel.worker import Worker
 
 from .fixtures import EnvModel
-import contextlib
-
-import pytest
-import asyncio
-
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +75,11 @@ def _run_in_env(env_dir: Path, args: list[str], timeout: int = 120) -> subproces
         [str(python_exe), *args],
         cwd=str(env_dir),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         timeout=timeout,
         check=False,  # we assert manually to show nice stderr on failure
     )
-
 
 @contextmanager
 def mp_exec(python_exe: str):
@@ -141,7 +134,7 @@ async def test_mlserver_environment_from_tarball_extracts(env_tarball: str, tmp_
     env_path = str(tmp_path / "env_from_tarball")
 
     env = await Environment.from_tarball(env_tarball, env_path)
-    assert getattr(env, "_env_path") == env_path
+    assert env._env_path == env_path
     assert env.env_hash == env_hash
 
     # Bonus: try executing the env python once to ensure basic run works
