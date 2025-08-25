@@ -67,6 +67,10 @@ from woprserver.parallel.pool import InferencePool, _spawn_worker
 from woprserver.parallel.utils import cancel_task, configure_inference_pool
 from woprserver.parallel.worker import Worker
 
+import subprocess
+import yaml
+from pathlib import Path
+
 # Import only model classes from fixtures; DO NOT re-declare root fixtures here.
 from .fixtures import (
     EnvModel,
@@ -173,7 +177,22 @@ Mock.assert_not_called_with = assert_not_called_with  # monkey-patch for tests
 @pytest.fixture(scope="session")
 def event_loop():
     loop = uvloop.new_event_loop()
-    yield loop
+    asyncio.set_event_loop(loop)
+    try:
+        yield loop
+    finally:
+        # Cancel any pending tasks to avoid shutdown hangs
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        # Python 3.9+
+        with contextlib.suppress(AttributeError, RuntimeError):
+            loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
 
 # --------------------------------------------------------------------------------------
 # Caching / env tarballs
@@ -271,10 +290,6 @@ def _acquire_tarball_lock_with_ttl(
                 )
 
             logger.info("Waiting on lock %s ... age=%.1fs ttl=%.1fs (held by PID %s?)", lock_path, age, ttl, pid)
-
-import subprocess
-import yaml
-from pathlib import Path
 
 def _export_poetry_requirements(cache_dir: str, with_dev: bool = True) -> Path:
     """

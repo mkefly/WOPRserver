@@ -2,7 +2,9 @@ from fastapi import status
 from mlserver.errors import MLServerError
 from mlserver.model import MLModel
 
-
+# --------------------------------------------------------------------------------------
+# Status constants: use FastAPI's if available, fallback to plain integers otherwise.
+# --------------------------------------------------------------------------------------
 class MLServerError(Exception):
     def __init__(self, msg: str, status_code: int = status.HTTP_400_BAD_REQUEST):
         super().__init__(msg)

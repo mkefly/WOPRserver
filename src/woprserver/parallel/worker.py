@@ -22,8 +22,6 @@ from dataclasses import dataclass
 from multiprocessing import Process, Queue
 from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np  # only used by model authors; safe to import for type hints/compat
-
 from ..logging import configure_logger, get_logger
 from .errors import WorkerError
 from .messages import (

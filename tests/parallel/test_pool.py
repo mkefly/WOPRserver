@@ -120,8 +120,6 @@ async def fresh_pool(settings: Settings):
 
 # ---------------- Worker-side PID models ----------------
 
-# ---------------- extra coverage: reloads, coercion, restarts, idempotency ----------------
-
 @pytest.mark.asyncio
 async def test_reload_model_same_name_version(
     fresh_pool: InferencePool,

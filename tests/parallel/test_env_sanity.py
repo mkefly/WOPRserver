@@ -111,7 +111,6 @@ def test_environment_tarball_runs_python_and_imports_sklearn(env_tarball: str, t
         )
 
     version = proc.stdout.strip()
-    # Match your env.yml pin from conftest: scikit-learn==1.3.1
     assert version == "1.6.1", f"Unexpected sklearn version: {version!r}"
 
 
