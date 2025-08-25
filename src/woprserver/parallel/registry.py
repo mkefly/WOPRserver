@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import signal
 import time
+from contextlib import suppress
+from typing import Optional
+from collections import Counter as RefCounter
 
 from mlserver.env import Environment, compute_hash_of_file, compute_hash_of_string
 from mlserver.model import MLModel
@@ -10,10 +15,10 @@ from mlserver.settings import ModelSettings, Settings
 from mlserver.utils import to_absolute_path
 
 from .errors import EnvironmentNotFound
-from ..logging import get_logger 
-logger = get_logger()
-
+from ..logging import get_logger
 from .pool import InferencePool, InferencePoolHook
+
+logger = get_logger()
 
 # -----------------------------------------------------------------------------
 # Constants & helpers
@@ -22,18 +27,25 @@ from .pool import InferencePool, InferencePoolHook
 ENV_HASH_ATTR = "__env_hash__"
 
 
-def _set_environment_hash(model: MLModel, env_hash: str | None) -> None:
+def _set_environment_hash(model: MLModel, env_hash: Optional[str]) -> None:
+    """
+    Attach (or remove) the environment hash used to load `model`.
+    """
     if env_hash is None:
         if hasattr(model, ENV_HASH_ATTR):
             delattr(model, ENV_HASH_ATTR)
         return
     setattr(model, ENV_HASH_ATTR, env_hash)
 
-def _get_environment_hash(model: MLModel) -> str | None:
+
+def _get_environment_hash(model: MLModel) -> Optional[str]:
     return getattr(model, ENV_HASH_ATTR, None)
 
 
-def _get_env_tarball(model: MLModel) -> str | None:
+def _get_env_tarball(model: MLModel) -> Optional[str]:
+    """
+    Return absolute path to the configured tarball, if any.
+    """
     model_settings = model.settings
     if model_settings.parameters is None:
         return None
@@ -43,32 +55,53 @@ def _get_env_tarball(model: MLModel) -> str | None:
     return to_absolute_path(model_settings, env_tarball)
 
 
-def _append_gid_environment_hash(env_hash: str, inference_pool_gid: str | None = None) -> str:
+def _append_gid_environment_hash(env_hash: str, inference_pool_gid: Optional[str] = None) -> str:
+    """
+    If a GID is supplied, combine it with the base env hash to produce an isolated key.
+    """
     return f"{env_hash}-{inference_pool_gid}"
+
+
+# -----------------------------------------------------------------------------
+# Metrics (best-effort; no-ops if prometheus isn't available)
+# -----------------------------------------------------------------------------
 
 _ENABLE_METRICS = os.getenv("POOL_REGISTRY_METRICS", "1") not in ("0", "false", "False", "")
 
-class _NoOpMetric:
-    def labels(self, *_a, **_k): return self
-    def inc(self, *_a, **_k): pass
-    def dec(self, *_a, **_k): pass
-    def set(self, *_a, **_k): pass
-    def observe(self, *_a, **_k): pass
 
-try:
+class _NoOpMetric:
+    def labels(self, *_a, **_k):
+        return self
+
+    def inc(self, *_a, **_k):
+        pass
+
+    def dec(self, *_a, **_k):
+        pass
+
+    def set(self, *_a, **_k):
+        pass
+
+    def observe(self, *_a, **_k):
+        pass
+
+
+try:  # pragma: no cover - optional
     if _ENABLE_METRICS:
         from prometheus_client import REGISTRY as PROM_REGISTRY  # type: ignore
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import Counter as PromCounter  # type: ignore
+        from prometheus_client import Gauge as PromGauge  # type: ignore
+        from prometheus_client import Histogram as PromHistogram  # type: ignore
     else:
         raise ImportError
 except Exception:  # pragma: no cover
-    Counter = Gauge = Histogram = None  # type: ignore
     PROM_REGISTRY = None  # type: ignore
+    PromCounter = PromGauge = PromHistogram = None  # type: ignore
 
 
 class _RegistryMetrics:
     def __init__(self) -> None:
-        if not _ENABLE_METRICS or Counter is None:
+        if not _ENABLE_METRICS or PromCounter is None:
             self.pools_created_total = _NoOpMetric()
             self.pools_active = _NoOpMetric()
             self.models_loaded_total = _NoOpMetric()
@@ -78,40 +111,40 @@ class _RegistryMetrics:
             self.pool_close_latency_seconds = _NoOpMetric()
             return
 
-        self.pools_created_total = Counter(
+        self.pools_created_total = PromCounter(
             "inference_pools_created_total",
             "Total number of inference pools created.",
             ["source"],  # tarball | existing_env | default_gid
             registry=PROM_REGISTRY,
         )
-        self.pools_active = Gauge(
+        self.pools_active = PromGauge(
             "inference_pools_active",
             "Current number of active (non-default) inference pools.",
             registry=PROM_REGISTRY,
         )
-        self.models_loaded_total = Counter(
+        self.models_loaded_total = PromCounter(
             "models_loaded_total",
             "Total models loaded via registry.",
-            ["pool"],  # env hash or "default" / gid
+            ["pool"],  # env key or "default"
             registry=PROM_REGISTRY,
         )
-        self.models_unloaded_total = Counter(
+        self.models_unloaded_total = PromCounter(
             "models_unloaded_total",
             "Total models unloaded via registry.",
             ["pool"],
             registry=PROM_REGISTRY,
         )
-        self.sigchld_events_total = Counter(
+        self.sigchld_events_total = PromCounter(
             "sigchld_events_total",
             "Number of SIGCHLD events handled; may include multiple children per event.",
             registry=PROM_REGISTRY,
         )
-        self.worker_stops_total = Counter(
+        self.worker_stops_total = PromCounter(
             "worker_stops_total",
             "Number of worker stop events processed.",
             registry=PROM_REGISTRY,
         )
-        self.pool_close_latency_seconds = Histogram(
+        self.pool_close_latency_seconds = PromHistogram(
             "pool_close_latency_seconds",
             "Time to close an inference pool.",
             ["pool"],
@@ -134,37 +167,51 @@ class InferencePoolRegistry:
       - existing env: hash(path) [+ gid]
       - tarball env:  hash(tarball) [+ gid]
       - no custom env but grouped: gid
-      - default: not stored in _pools (kept in _default_pool)
+      - default: kept in _default_pool (not present in _pools)
     """
 
     def __init__(self, settings: Settings, on_worker_stop: list[InferencePoolHook] | None = None):
         self._settings = settings
         self._on_worker_stop = on_worker_stop or []
         self._default_pool = InferencePool(self._settings, on_worker_stop=self._on_worker_stop)
+
+        # Mapping of key -> pool (key is env-hash[+gid] or gid)
         self._pools: dict[str, InferencePool] = {}
-        self._pool_locks: dict[str, asyncio.Lock] = {}  # per-key creation locks
+
+        # Reference count of models using a given keyed pool
+        self._pool_refcount: RefCounter[str] = RefCounter()
+
+        # Per-key creation locks to avoid races
+        self._pool_locks: dict[str, asyncio.Lock] = {}
+
+        # Registry-wide lock for fast mutations (pop on unload)
+        self._lock = asyncio.Lock()
+
+        # For SIGCHLD processing
         self._original_sigchld_handler = None
 
         os.makedirs(self._settings.environments_dir, exist_ok=True)
 
-        # Register SIGCHLD using the event loop when possible; fall back gracefully if unavailable.
+        # Register SIGCHLD via the event loop when available; fall back otherwise
         try:
             if hasattr(signal, "SIGCHLD"):
                 loop = asyncio.get_running_loop()
                 self._original_sigchld_handler = signal.getsignal(signal.SIGCHLD)
-                loop.add_signal_handler(signal.SIGCHLD, lambda: asyncio.create_task(self._handle_worker_stop()))
+                loop.add_signal_handler(
+                    signal.SIGCHLD, lambda: asyncio.create_task(self._handle_worker_stop())
+                )
                 logger.debug("SIGCHLD handler registered via event loop.")
         except (RuntimeError, AttributeError, NotImplementedError):
-            # No running loop or unsupported platform; try process-level handler (best effort)
             try:
                 if hasattr(signal, "SIGCHLD"):
                     self._original_sigchld_handler = signal.getsignal(signal.SIGCHLD)
-                    signal.signal(signal.SIGCHLD, lambda *_: asyncio.create_task(self._handle_worker_stop()))
+                    signal.signal(
+                        signal.SIGCHLD, lambda *_: asyncio.create_task(self._handle_worker_stop())
+                    )
                     logger.debug("SIGCHLD handler registered via signal.signal().")
-            except Exception:
+            except Exception:  # pragma: no cover
                 logger.debug("SIGCHLD handler not installed; platform may not support it.")
 
-        # Initialize pools_active gauge
         _METRICS.pools_active.set(0)
 
     # ------------------------------------------------------------------ utils
@@ -178,47 +225,59 @@ class InferencePoolRegistry:
     # ---------------------------------------------------------------- creators
 
     async def _get_or_create(self, model: MLModel) -> InferencePool:
+        """
+        Return the pool for this model, creating it if necessary, and increment refcount.
+        """
         params = model.settings.parameters
         if params is not None and params.environment_path:
-            return await self._get_or_create_with_existing_env(
+            pool, key = await self._get_or_create_with_existing_env(
                 params.environment_path, params.inference_pool_gid
             )
-        return await self._get_or_create_with_tarball(model)
+            # Increment refcount for every successful *logical* attach
+            async with self._lock:
+                self._pool_refcount[key] += 1
+            return pool
+
+        return await self._get_or_create_with_tarball_or_gid(model)
 
     async def _get_or_create_with_existing_env(
         self,
         environment_path: str,
-        inference_pool_gid: str | None,
-    ) -> InferencePool:
+        inference_pool_gid: Optional[str],
+    ) -> tuple[InferencePool, str]:
         """
         Create or return the pool keyed by an existing Python environment path (+ optional gid).
+        Returns (pool, key).
         """
         expanded_path = os.path.abspath(os.path.expanduser(os.path.expandvars(environment_path)))
-        logger.info(f"Using existing environment: {expanded_path}")
-        env_hash = await compute_hash_of_string(expanded_path)
-        if inference_pool_gid:
-            env_hash = _append_gid_environment_hash(env_hash, inference_pool_gid)
+        logger.info("Using existing environment: %s", expanded_path)
 
-        async with self._lock_for(env_hash):
-            pool = self._pools.get(env_hash)
+        env_hash = await compute_hash_of_string(expanded_path)
+        key = env_hash
+        if inference_pool_gid:
+            key = _append_gid_environment_hash(env_hash, inference_pool_gid)
+
+        async with self._lock_for(key):
+            pool = self._pools.get(key)
             if pool:
-                return pool
+                return pool, key
 
             env = Environment(env_path=expanded_path, env_hash=env_hash, delete_env=False)
             pool = InferencePool(self._settings, env=env, on_worker_stop=self._on_worker_stop)
-            self._pools[env_hash] = pool
+            self._pools[key] = pool
 
             _METRICS.pools_created_total.labels(source="existing_env").inc()
             _METRICS.pools_active.set(len(self._pools))
-            logger.info(f"Created inference pool for env '{env_hash}'.")
-            return pool
+            logger.info("Created inference pool for env '%s'.", key)
+            return pool, key
 
-    async def _get_or_create_with_tarball(self, model: MLModel) -> InferencePool:
+    async def _get_or_create_with_tarball_or_gid(self, model: MLModel) -> InferencePool:
         """
         Create or return the pool for models using a tarball as their Python environment.
         If no tarball is configured:
          - with GID: returns/creates a GID-keyed pool
          - without GID: returns default pool
+        Also increments the refcount for the chosen pool (except the default pool).
         """
         env_tarball = _get_env_tarball(model)
         gid = model.settings.parameters.inference_pool_gid if model.settings.parameters else None
@@ -230,33 +289,36 @@ class InferencePoolRegistry:
             key = gid  # GID-isolated pool
             async with self._lock_for(key):
                 pool = self._pools.get(key)
-                if pool:
-                    return pool
-                pool = InferencePool(self._settings, on_worker_stop=self._on_worker_stop)
-                self._pools[key] = pool
-                _METRICS.pools_created_total.labels(source="default_gid").inc()
-                _METRICS.pools_active.set(len(self._pools))
-                logger.info(f"Created inference pool for gid '{gid}'.")
-                return pool
+                if pool is None:
+                    pool = InferencePool(self._settings, on_worker_stop=self._on_worker_stop)
+                    self._pools[key] = pool
+                    _METRICS.pools_created_total.labels(source="default_gid").inc()
+                    _METRICS.pools_active.set(len(self._pools))
+                    logger.info("Created inference pool for gid '%s'.", gid)
+            async with self._lock:
+                self._pool_refcount[key] += 1
+            return pool
 
         # Custom env tarball:
         env_hash = await compute_hash_of_file(env_tarball)
+        key = env_hash
         if gid:
-            env_hash = _append_gid_environment_hash(env_hash, gid)
+            key = _append_gid_environment_hash(env_hash, gid)
 
-        async with self._lock_for(env_hash):
-            pool = self._pools.get(env_hash)
-            if pool:
-                return pool
+        async with self._lock_for(key):
+            pool = self._pools.get(key)
+            if pool is None:
+                env = await self._extract_tarball(env_hash, env_tarball)
+                pool = InferencePool(self._settings, env=env, on_worker_stop=self._on_worker_stop)
+                self._pools[key] = pool
+                _METRICS.pools_created_total.labels(source="tarball").inc()
+                _METRICS.pools_active.set(len(self._pools))
+                logger.info("Created inference pool for env '%s'.", key)
 
-            env = await self._extract_tarball(env_hash, env_tarball)
-            pool = InferencePool(self._settings, env=env, on_worker_stop=self._on_worker_stop)
-            self._pools[env_hash] = pool
+        async with self._lock:
+            self._pool_refcount[key] += 1
 
-            _METRICS.pools_created_total.labels(source="tarball").inc()
-            _METRICS.pools_active.set(len(self._pools))
-            logger.info(f"Created inference pool for env '{env_hash}'.")
-            return pool
+        return pool
 
     async def _extract_tarball(self, env_hash: str, env_tarball: str) -> Environment:
         """
@@ -276,10 +338,8 @@ class InferencePoolRegistry:
             with open(lock_path, "w"):
                 return await Environment.from_tarball(env_tarball, env_path, env_hash)
         finally:
-            try:
+            with suppress(FileNotFoundError):
                 os.remove(lock_path)
-            except FileNotFoundError:
-                pass
 
     def _get_env_path(self, env_hash: str) -> str:
         return os.path.join(self._settings.environments_dir, env_hash)
@@ -337,16 +397,21 @@ class InferencePoolRegistry:
         if not parameters or not parameters.environment_tarball:
             return model_initialiser(model_settings)
 
+        # Placeholder prevents importing user code in the parent process
         return MLModel(model_settings)
 
     # ---------------------------------------------------------------- actions
 
     async def load_model(self, model: MLModel) -> MLModel:
+        """
+        Load `model` into the appropriate pool (creating one if necessary).
+        """
         if not self._should_load_model(model.settings):
             return model
 
         pool = await self._get_or_create(model)
         loaded = await pool.load_model(model)
+        # Persist the pool's env hash (may be None for gid-only/default)
         _set_environment_hash(loaded, pool.env_hash)
 
         label = pool.env_hash or "default"
@@ -354,17 +419,26 @@ class InferencePoolRegistry:
         return loaded
 
     async def reload_model(self, old_model: MLModel, new_model: MLModel) -> MLModel:
+        """
+        Reload `old_model` with `new_model`. If the environment/pool changed, the
+        old pool is decremented and possibly torn down.
+        """
         if not self._should_load_model(new_model.settings):
             return new_model
 
-        old_hash = _get_environment_hash(old_model)
-        new_pool = await self._get_or_create(new_model)
+        old_key = _get_environment_hash(old_model) or (
+            old_model.settings.parameters.inference_pool_gid if old_model.settings.parameters else None
+        )
 
+        new_pool = await self._get_or_create(new_model)
         loaded = await new_pool.reload_model(old_model, new_model)
         _set_environment_hash(loaded, new_pool.env_hash)
 
-        if old_hash != new_pool.env_hash:
-            # Environment changed; unload old one from its pool
+        # If we moved pools, unload the old model (which will decrement & maybe close)
+        new_key = new_pool.env_hash or (
+            new_model.settings.parameters.inference_pool_gid if new_model.settings.parameters else None
+        )
+        if old_key != new_key:
             await self.unload_model(old_model)
 
         label = new_pool.env_hash or "default"
@@ -372,18 +446,47 @@ class InferencePoolRegistry:
         return loaded
 
     async def unload_model(self, model: MLModel) -> MLModel:
+        """
+        Unload `model` from its pool. If the pool refcount reaches zero, remove
+        the key from `_pools` **immediately** and then close the pool (best-effort).
+        This guarantees the key disappears quickly for tests/liveness checks.
+        """
         if not self._should_load_model(model.settings):
             return model
 
         pool = await self._find(model)
         unloaded = await pool.unload_model(model)
 
+        # Determine the registry key for this pool (env_hash preferred; else gid)
+        key = pool.env_hash or (
+            model.settings.parameters.inference_pool_gid if model.settings.parameters else None
+        )
+
         label = pool.env_hash or "default"
         _METRICS.models_unloaded_total.labels(pool=label).inc()
 
-        if pool is not self._default_pool and pool.empty():
-            logger.info(f"Inference pool with hash '{pool.env_hash}' is now empty")
-            await self._close_pool(pool.env_hash)
+        # Default pool is never keyed in _pools
+        if key is None:
+            return unloaded
+
+        # Decide whether to tear the keyed pool down
+        to_close: Optional[InferencePool] = None
+        async with self._lock:
+            self._pool_refcount[key] -= 1
+            if self._pool_refcount[key] <= 0:
+                self._pool_refcount.pop(key, None)
+                # Pop the pool entry **immediately** so external checks see it gone
+                to_close = self._pools.pop(key, None)
+                _METRICS.pools_active.set(len(self._pools))
+                # Remove the per-key creation lock as well (not strictly required)
+                self._pool_locks.pop(key, None)
+
+        if to_close is not None:
+            # Close the pool best-effort, but the key is already gone
+            try:
+                await asyncio.wait_for(self._close_pool_instance(to_close), timeout=2.5)
+            except Exception as e:  # pragma: no cover - non-fatal cleanup
+                logger.warning("Pool '%s' close() failed or timed out: %s", key, e)
 
         return unloaded
 
@@ -393,7 +496,8 @@ class InferencePoolRegistry:
         """
         Handle SIGCHLD: drain all available dead children and notify pools.
         """
-        _METRICS.sigchld_events_total.inc()
+        if PromCounter is not None:
+            _METRICS.sigchld_events_total.inc()
 
         processed = 0
         while True:
@@ -409,47 +513,64 @@ class InferencePoolRegistry:
                 continue  # graceful exit
 
             processed += 1
-            _METRICS.worker_stops_total.inc()
+            if PromCounter is not None:
+                _METRICS.worker_stops_total.inc()
             await self._default_pool.on_worker_stop(pid, exit_code)
-            await asyncio.gather(*(pool.on_worker_stop(pid, exit_code) for pool in self._pools.values()))
+            # Notify all keyed pools
+            await asyncio.gather(*(pool.on_worker_stop(pid, exit_code) for pool in list(self._pools.values())))
 
         if processed:
             logger.debug("Handled %d worker stop event(s).", processed)
 
     async def close(self) -> None:
+        """
+        Close all pools and restore signal handlers.
+        """
         # Restore signal handler if we installed it
         if hasattr(signal, "SIGCHLD") and self._original_sigchld_handler is not None:
-            try:
+            with suppress(Exception):
                 signal.signal(signal.SIGCHLD, self._original_sigchld_handler)
-            except Exception:
-                pass
 
-        # Close default and all keyed pools
-        await asyncio.gather(
-            self._close_pool(None),
-            *(self._close_pool(env_hash) for env_hash in list(self._pools)),
-        )
-        self._pools.clear()
+        # Close keyed pools first
+        for key, pool in list(self._pools.items()):
+            with suppress(Exception):
+                await self._close_pool_instance(pool)
+            self._pools.pop(key, None)
+
         _METRICS.pools_active.set(len(self._pools))
 
-    async def _close_pool(self, env_hash: str | None = None) -> None:
-        pool = self._default_pool if env_hash is None else self._pools.get(env_hash)
+        # Close default pool
+        with suppress(Exception):
+            await self._close_pool_instance(self._default_pool)
+
+        # Clear bookkeeping
+        self._pool_refcount.clear()
+        self._pool_locks.clear()
+
+    async def _close_pool(self, key: Optional[str] = None) -> None:
+        """
+        Close a pool by key (or default pool if key is None).
+        Note: Prefer using unload_model to manage lifecycle automatically.
+        """
+        pool = self._default_pool if key is None else self._pools.get(key)
         if pool is None:
             return
+        await self._close_pool_instance(pool)
+        if key is not None:
+            self._pools.pop(key, None)
+            _METRICS.pools_active.set(len(self._pools))
 
+    async def _close_pool_instance(self, pool: InferencePool) -> None:
+        """
+        Close a given InferencePool instance and record latency.
+        """
         label = pool.env_hash or "default"
-        logger.info(f"Waiting for shutdown of {pool.name}...")
+        logger.info("Waiting for shutdown of %s...", pool.name)
         t0 = time.perf_counter()
         await pool.close()
         dt = max(time.perf_counter() - t0, 0.0)
         _METRICS.pool_close_latency_seconds.labels(pool=label).observe(dt)
-        logger.info(f"Shutdown of {pool.name} complete in {dt:.3f}s")
-
-        if env_hash:
-            # Force calling __del__ on `Environment` to clean up
-            try:
-                self._pools[env_hash]._env = None  # pylint: disable=protected-access
-            except Exception:
-                pass
-            self._pools.pop(env_hash, None)
-            _METRICS.pools_active.set(len(self._pools))
+        logger.info("Shutdown of %s complete in %.3fs", pool.name, dt)
+        # Help GC any Environment
+        with suppress(Exception):
+            pool._env = None  # pylint: disable=protected-access

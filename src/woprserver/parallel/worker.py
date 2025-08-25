@@ -17,6 +17,7 @@ from contextlib import nullcontext, AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Process, Queue
 from typing import Any, AsyncIterator, Optional
+import contextlib
 
 import numpy as np
 from prometheus_client import REGISTRY as PROM_REGISTRY
@@ -47,7 +48,7 @@ from .messages import (
     ModelUpdateMessage,
     ModelUpdateType,
 )
-from .utils import END_OF_QUEUE, terminate_queue
+from .utils import END_OF_QUEUE, terminate_queue, make_queue
 
 # -----------------------------------------------------------------------------
 # Config & Metrics
@@ -442,11 +443,12 @@ class Worker(Process):
         super().__init__()
         self._settings = settings
         self._responses: Queue = responses
-        self._requests: Queue = Queue()
-        self._model_updates: Queue = Queue()
+        self._requests: Queue = make_queue()
+        self._model_updates: Queue = make_queue()
         self._env = env
         self.__executor: Optional[ThreadPoolExecutor] = None
-
+        # Futures returned by run_in_executor for our MP->async bridges.
+        self._bridge_futures: list = []
         self._model_registry: Optional[MultiModelRegistry] = None
         self._active: bool = False
         # Map (request_id, channel_id) -> asyncio.Queue that feeds the model method.
@@ -474,7 +476,6 @@ class Worker(Process):
             asyncio.run(self._coro_run())
 
     async def _coro_run(self) -> None:
-        """Async main: init runtime, wire bridges, then serve requests + updates."""
         self._init_runtime()
         loop = asyncio.get_running_loop()
         self._install_signal_ignores(loop)
@@ -484,10 +485,19 @@ class Worker(Process):
         self._start_mp_bridge(self._requests, request_async_queue)
         self._start_mp_bridge(self._model_updates, update_async_queue)
 
-        await asyncio.gather(
-            self._requests_loop(request_async_queue),
-            self._updates_loop(update_async_queue),
-        )
+        try:
+            await asyncio.gather(
+                self._requests_loop(request_async_queue),
+                self._updates_loop(update_async_queue),
+            )
+        finally:
+            # Ensure bridge threads finish while the loop is still alive
+            for fut in list(self._bridge_futures):
+                with contextlib.suppress(Exception):
+                    await fut               # <- important
+            self._bridge_futures.clear()
+            # Tear down the dedicated executor used for the bridges
+            self._executor.shutdown(wait=False, cancel_futures=True)
 
     # ---------------------------- init helpers ------------------------------
 
@@ -511,23 +521,70 @@ class Worker(Process):
 
     def _start_mp_bridge(self, mpq: Queue, aq: asyncio.Queue) -> None:
         """
-        Continuously pump a multiprocessing.Queue into an asyncio.Queue.
-        Preserves END_OF_QUEUE to signal graceful shutdown.
+        Bridge a multiprocessing.Queue (blocking, cross-process) into an asyncio.Queue
+        (non-blocking, loop-bound).
+
+        Why a bridge at all?
+        - multiprocessing.Queue blocks and isn’t awaitable.
+        - We read it in a background thread and hand off items to the event loop,
+        so async code downstream stays non-blocking.
         """
         loop = asyncio.get_running_loop()
 
-        def _pump() -> None:
+        def safe_put(item) -> bool:
+            """
+            Schedule aq.put_nowait(item) on the event loop from a worker thread.
+
+            Why call_soon_threadsafe?
+            - It’s the supported way to poke the loop from another thread.
+
+            Why both loop.is_closed() and a RuntimeError guard?
+            - The loop can close at any moment during teardown. is_closed() avoids
+            most races, but the loop might still close between the check and the
+            call; catching RuntimeError covers that final window.
+            - Returning False tells the pump to exit quietly during shutdown.
+            """
+            if loop.is_closed():
+                return False
+            try:
+                loop.call_soon_threadsafe(aq.put_nowait, item)
+                return True
+            except RuntimeError:
+                return False
+
+        def pump() -> None:
+            """
+            Blocking reader that runs in a thread and forwards items into the loop.
+
+            Why exit on END_OF_QUEUE?
+            - It’s our explicit shutdown sentinel; forwarding it lets the async side
+            stop cleanly.
+
+            Why swallow EOFError/OSError?
+            - Those mean the other end of the mp queue disappeared (process exit /
+            teardown). Exiting quietly avoids noisy, misleading errors.
+            """
             while True:
                 try:
                     msg = mpq.get()
                 except (EOFError, OSError):
-                    break
-                if msg is END_OF_QUEUE:
-                    loop.call_soon_threadsafe(aq.put_nowait, END_OF_QUEUE)
-                    break
-                loop.call_soon_threadsafe(aq.put_nowait, msg)
+                    return  # Queue torn down; exit quietly.
 
-        loop.run_in_executor(self._executor, _pump)
+                if msg is END_OF_QUEUE:
+                    safe_put(END_OF_QUEUE)  # propagate sentinel to async side
+                    return
+
+                if not safe_put(msg):
+                    # Loop is closing/closed; further deliveries would just error.
+                    return
+
+        # Why run_in_executor instead of starting our own thread?
+        # - Reuses the worker’s ThreadPoolExecutor (fewer threads to manage).
+        # - Returns a Future bound to the loop, so stop() can await it and ensure
+        #   the bridge finishes before the loop is torn down.
+        fut = loop.run_in_executor(self._executor, pump)
+        self._bridge_futures.append(fut)  # stop() will await these to quiesce bridges
+
 
     # ------------------------------ loops -----------------------------------
 
@@ -707,11 +764,11 @@ class Worker(Process):
     async def _process_request(self, request: ModelRequestMessage) -> _Outcome:
         """
         Main handler for model requests:
-          1) increment request counter,
-          2) time end-to-end latency,
-          3) invoke the target method,
-          4) stream or return the result accordingly,
-          5) mark exceptions exactly once.
+            1) increment request counter,
+            2) time end-to-end latency,
+            3) invoke the target method,
+            4) stream or return the result accordingly,
+            5) mark exceptions exactly once.
         """
         model_name, method_name = _labels_from_request(request)
         _METRICS.requests_total.labels(model=model_name, method=method_name).inc()
@@ -825,4 +882,14 @@ class Worker(Process):
           - Shutdown the thread pool executor
         """
         await self._shutdown_queues(self._model_updates, self._requests)
+        # Ensure bridge threads have finished before the loop is torn down.
+        try:
+            for fut in list(self._bridge_futures):
+                try:
+                    # Convert to asyncio Future so we can await it.
+                    await asyncio.wrap_future(fut)
+                except Exception:
+                    pass
+        finally:
+            self._bridge_futures.clear()
         self._executor.shutdown(wait=False, cancel_futures=True)

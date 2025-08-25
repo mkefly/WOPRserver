@@ -4,6 +4,7 @@ from asyncio import Task
 from multiprocessing import Queue
 
 from mlserver.settings import Settings
+from multiprocessing.context import BaseContext
 
 from ..logging import get_logger 
 logger = get_logger()
@@ -63,15 +64,11 @@ def configure_inference_pool(settings: Settings) -> None:
         )
 
 
-def get_mp_context() -> mp.context.BaseContext:
-    """
-    Return the multiprocessing context that should be used for objects
-    shared with worker processes. Defaults to 'spawn'.
-    """
+def get_mp_context() -> BaseContext:
+    """Return the multiprocessing context to use for shared objects (defaults to 'spawn')."""
     try:
         method = mp.get_start_method()
     except RuntimeError:
-        # Not set yet; prefer spawn
         method = "spawn"
     return mp.get_context(method)
 
@@ -82,9 +79,14 @@ def make_queue(maxsize: int = 0) -> Queue:
 
     Using the context ensures the queue is compatible with the chosen start method.
     """
-    ctx = get_mp_context()
-    return ctx.Queue(maxsize=maxsize)
-
+    ctx = mp.get_context()
+    q = ctx.Queue(maxsize=maxsize)
+    # Optional: avoid join thread waits on shutdown
+    try:
+        q.cancel_join_thread()
+    except Exception:
+        pass
+    return q
 
 async def terminate_queue(queue: Queue, *, timeout: float = 0.0) -> bool:
     """

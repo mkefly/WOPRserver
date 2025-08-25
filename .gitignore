@@ -17,10 +17,11 @@ benchmarking/k6
 
 # Mac file system
 **/.DS_Store
-
+install.sh
 # editor and IDE paraphernalia
 .idea
 .vscode
+pyrightconfig.json
 .project
 *.swp
 *.swo

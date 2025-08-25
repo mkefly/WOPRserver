@@ -1,22 +1,13 @@
-#tests/parallel/conftest.py
-
-import multiprocessing as mp
-
-# Make sure 'spawn' is set BEFORE anything imports multiprocessing users
-try:
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
+# tests/parallel/conftest.py
+from __future__ import annotations
 
 import asyncio
 import contextlib
 import glob
 import json
+import multiprocessing as mp
 import os
-import platform
 import shutil
-
-# tests/parallel/conftest.py
 import sys
 import tarfile
 import time
@@ -25,19 +16,30 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
+from woprserver.server import WOPRserver
+
+# Set multiprocessing *before* importing users of multiprocessing.
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
 import prometheus_client
 import pytest
 import pytest_asyncio
+import yaml
 from filelock import FileLock, Timeout
+from prometheus_client.registry import REGISTRY as PROM_DEFAULT_REGISTRY
+from prometheus_client.registry import CollectorRegistry
+from starlette_exporter import PrometheusMiddleware
+
 from mlserver import types
 from mlserver.codecs.string import StringCodec
 from mlserver.env import Environment
 from mlserver.handlers import DataPlane, ModelRepositoryHandlers
-from mlserver.logging import configure_logger
 from mlserver.metrics.registry import REGISTRY as METRICS_REGISTRY
 from mlserver.metrics.registry import MetricsRegistry
 from mlserver.model import MLModel
-from mlserver.parallel import InferencePoolRegistry
 from mlserver.registry import MultiModelRegistry
 from mlserver.repository import (
     DEFAULT_MODEL_SETTINGS_FILENAME,
@@ -47,9 +49,9 @@ from mlserver.repository import (
 from mlserver.rest import RESTServer
 from mlserver.settings import ModelParameters, ModelSettings, Settings
 from mlserver.types import InferenceRequest, InferenceResponse, MetadataModelResponse
-from prometheus_client.registry import REGISTRY, CollectorRegistry
-from starlette_exporter import PrometheusMiddleware
 
+from woprserver.logging import get_logger
+from woprserver.parallel import InferencePoolRegistry
 from woprserver.parallel.dispatcher import Dispatcher
 from woprserver.parallel.messages import (
     ModelRequestMessage,
@@ -73,36 +75,45 @@ from .fixtures import (
     TextModel,
     TextStreamModel,
 )
-from .utils import RESTClient, get_available_ports
+from .utils import _get_tarball_name, _pack, get_available_ports
 
-# --------------------------
+logger = get_logger()
+
+# --------------------------------------------------------------------------------------
 # Constants / paths
-# --------------------------
+# --------------------------------------------------------------------------------------
 MIN_PYTHON_VERSION = (3, 9)
 MAX_PYTHON_VERSION = (3, 12)
 TESTS_PATH = Path(__file__).parent
 TESTDATA_PATH = TESTS_PATH / "testdata"
 TESTDATA_CACHE_PATH = TESTDATA_PATH / ".cache"
 
-
-# --------------------------
-# Pydantic v2-safe loader
-# --------------------------
+# --------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------
 def _load_json_model(Model, path: Path):
+    """
+    Pydantic v1/v2 safe JSON loader for small models used in tests.
+    """
     raw = path.read_text()
-    if hasattr(Model, "model_validate_json"):  # Pydantic v2
+    if hasattr(Model, "model_validate_json"):  # Pydantic v2+
         return Model.model_validate_json(raw)
     try:
+        # v1: prefer parse_raw (fast), fall back to parse_file for older models
         return Model.parse_raw(raw)  # type: ignore[attr-defined]
     except Exception:
         return Model.parse_file(str(path))  # type: ignore[attr-defined]
 
 
 def make_dispatcher():
+    """
+    Tiny dispatcher substitute for unit tests which don't exercise real routing.
+    """
     async def _noop_bridge(*_a, **_k):
         return None
 
     from types import SimpleNamespace
+
     return SimpleNamespace(
         dispatch_request=None,
         dispatch_request_stream=None,
@@ -111,33 +122,36 @@ def make_dispatcher():
     )
 
 
-# --------------------------
-# Speed helpers
-# --------------------------
 def _default_py_matrix() -> list[tuple[int, int]]:
+    """
+    Fast default: test against the *current* interpreter only unless FULL_PY_MATRIX is set.
+    """
     if os.getenv("FULL_PY_MATRIX") in {"1", "true", "yes"}:
         return [
             (major, minor)
             for major in range(MIN_PYTHON_VERSION[0], MAX_PYTHON_VERSION[0] + 1)
             for minor in range(MIN_PYTHON_VERSION[1], MAX_PYTHON_VERSION[1] + 1)
         ]
-    import sys
     return [(sys.version_info.major, sys.version_info.minor)]
 
 
 PYTHON_VERSIONS = _default_py_matrix()
 
 
-def unregister_metrics(registry: CollectorRegistry):
+def unregister_metrics(registry: CollectorRegistry) -> None:
+    """
+    Best-effort unregister of all collectors to avoid cross-test name clashes.
+    """
     collectors = list(getattr(registry, "_collector_to_names", {}).keys())
     for collector in collectors:
-        try:
+        with contextlib.suppress(Exception):
             registry.unregister(collector)
-        except Exception:
-            pass
 
 
-def assert_not_called_with(self, *args, **kwargs):
+def assert_not_called_with(self: Mock, *args, **kwargs) -> None:
+    """
+    Convenience negative assertion for unittest.mock.Mock.
+    """
     try:
         self.assert_called_with(*args, **kwargs)
     except AssertionError:
@@ -147,20 +161,20 @@ def assert_not_called_with(self, *args, **kwargs):
     )
 
 
-Mock.assert_not_called_with = assert_not_called_with
+Mock.assert_not_called_with = assert_not_called_with  # monkey-patch for tests
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Async loop & logging
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def event_loop():
     """
     Session-scoped loop so module-/session-scoped async fixtures can depend on it.
-    Compatible with pytest-asyncio 0.21.x strict/auto.
+    Plays nice with pytest-asyncio 0.21.x strict/auto.
     """
     try:
         import uvloop
+
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     except Exception:
         pass
@@ -172,27 +186,78 @@ def event_loop():
         loop.run_until_complete(asyncio.sleep(0))
         loop.close()
 
+# --------------------------------------------------------------------------------------
+# Caching / env tarballs
+# --------------------------------------------------------------------------------------
+def _is_stale(lock_file: Path, max_age_s: float = 120.0) -> bool:
+    with contextlib.suppress(FileNotFoundError):
+        age = time.time() - lock_file.stat().st_mtime
+        return age > max_age_s
+    return False
 
-@pytest.fixture(scope="session", autouse=True)
-def _logger_once():
+
+def _safe_remove(path: Path) -> None:
+    with contextlib.suppress(Exception):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _is_valid_tar(path: str) -> bool:
+    """
+    Quick sanity check: exists, not tiny, and tar.gz opens.
+    """
     try:
-        _settings = _load_json_model(Settings, TESTDATA_PATH / "settings.json")
-        configure_logger(_settings)
+        if not os.path.isfile(path) or os.path.getsize(path) < 1024:
+            return False
+        with tarfile.open(path, "r:gz"):
+            return True
     except Exception:
-        pass
-    yield
+        return False
 
 
-@pytest.fixture(autouse=True)
-def logger():
-    return configure_logger(_load_json_model(Settings, TESTDATA_PATH / "settings.json"))
+def _acquire_tarball_lock_with_ttl(path: str, ttl: float = 120.0, ping: float = 2.0) -> FileLock:
+    """
+    Spin until we acquire a file lock, evicting stale locks past `ttl`.
+    """
+    lock_path = Path(f"{path}.lock")
+    lock = FileLock(str(lock_path))
+    while True:
+        try:
+            lock.acquire(timeout=ping)
+            logger.info("Acquired lock %s", lock_path)
+            return lock
+        except Timeout:
+            if _is_stale(lock_path, max_age_s=ttl):
+                logger.warning("Stale lock detected; removing %s", lock_path)
+                _safe_remove(lock_path)
+            else:
+                logger.info("Waiting on lock %s ...", lock_path)
 
 
-# --------------------------
-# Caching / session-level heavy bits
-# --------------------------
+def _env_yml_abs_editable(cache_dir: str) -> str:
+    """
+    Write a minimal env.yml that installs this repo in editable mode.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    env_spec = {
+        "name": "custom-runtime-environment",
+        "channels": ["conda-forge"],
+        "dependencies": [
+            "scikit-learn==1.3.1",
+            "pip",
+            {"pip": [str(repo_root)]},
+        ],
+    }
+    out = Path(cache_dir) / "environment-template.yml"
+    out.write_text(yaml.safe_dump(env_spec, sort_keys=False))
+    return str(out)
+
+
 @pytest.fixture(scope="session")
 def testdata_cache_path() -> str:
+    """`tests/testdata/.cache` folder path."""
     TESTDATA_CACHE_PATH.mkdir(parents=True, exist_ok=True)
     return str(TESTDATA_CACHE_PATH)
 
@@ -203,97 +268,33 @@ def testdata_cache_path() -> str:
     ids=[f"py{major}{minor}" for (major, minor) in PYTHON_VERSIONS],
 )
 def env_python_version(request: pytest.FixtureRequest) -> tuple[int, int]:
+    """Parameterize tests by Python version (see `_default_py_matrix`)."""
     return request.param
 
 
-# --- helpers ----------------------------------------------------------------
-
-def _is_stale(lock_file: Path, max_age_s: float = 120.0) -> bool:
-    try:
-        age = time.time() - lock_file.stat().st_mtime
-        return age > max_age_s
-    except FileNotFoundError:
-        return False
-
-def _safe_remove(path: Path) -> None:
-    with contextlib.suppress(Exception):
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink(missing_ok=True)
-
-# --- fixture ----------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-def env_tarball(tmp_path_factory, request) -> str:
+@pytest.fixture
+async def env_tarball(env_python_version: tuple[int, int], testdata_cache_path: str) -> str:
     """
-    Build/provide the reusable environment tarball once per session.
-    Uses a file lock with timeout and stale-lock recovery to avoid deadlocks.
+    Create or reuse a packed conda env tarball for the given Python version.
+    Cross-process safe via a TTL file lock.
     """
-    base_tmp = Path(tmp_path_factory.getbasetemp())  # unique per session/worker
-    # Make the tarball/lock path deterministic but namespaced by Python+arch
-    py_tag = f"py{sys.version_info.major}{sys.version_info.minor}"
-    arch_tag = platform.machine()
-    target_dir = base_tmp / f"env-tarball-{py_tag}-{arch_tag}"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    tarball_name = _get_tarball_name(env_python_version)
+    tarball_path = os.path.join(testdata_cache_path, tarball_name)
 
-    tarball_path = target_dir / "env.tgz"
-    lock_path = target_dir / ".env.tgz.lock"
+    Path(testdata_cache_path).mkdir(parents=True, exist_ok=True)
+    lock = _acquire_tarball_lock_with_ttl(tarball_path, ttl=180.0, ping=2.0)
 
-    # Fast path: already built
-    if tarball_path.exists() and tarball_path.stat().st_size > 0:
-        print(f"[env_tarball] Reusing existing tarball at {tarball_path}", flush=True)
-        return str(tarball_path)
+    with lock:
+        if os.path.isfile(tarball_path) and _is_valid_tar(tarball_path):
+            return tarball_path
+        if os.path.exists(tarball_path) and not _is_valid_tar(tarball_path):
+            logger.warning("Removing invalid tarball at %s", tarball_path)
+            _safe_remove(Path(tarball_path))
 
-    # Guard with a lock, but never wait forever
-    lock = FileLock(str(lock_path), timeout=10.0)
+        env_yml_dynamic = _env_yml_abs_editable(testdata_cache_path)
+        await _pack(env_python_version, env_yml_dynamic, tarball_path)
 
-    try:
-        try:
-            print(f"[env_tarball] Acquiring lock {lock_path} ...", flush=True)
-            lock.acquire()  # explicit acquire so we can log around it
-        except Timeout:
-            # If the lock is stale, remove it and try once more
-            if _is_stale(lock_path, max_age_s=180.0):
-                print(f"[env_tarball] Stale lock detected; removing {lock_path}", flush=True)
-                _safe_remove(lock_path)
-                # Try one last time with a short timeout
-                lock = FileLock(str(lock_path), timeout=5.0)
-                lock.acquire()
-            else:
-                pytest.skip(f"[env_tarball] Lock busy: {lock_path}")
-
-        # Double-check another proc didn't build while we waited
-        if tarball_path.exists() and tarball_path.stat().st_size > 0:
-            print(f"[env_tarball] Tarball appeared while waiting; using {tarball_path}", flush=True)
-            return str(tarball_path)
-
-        # Build the tarball (create a tiny, deterministic env payload for tests).
-        # Replace this block with your real environment bundle generation if needed.
-        build_dir = target_dir / "env-root"
-        _safe_remove(build_dir)
-        build_dir.mkdir(parents=True, exist_ok=True)
-
-        # Minimal file to make the tarball non-empty & deterministic
-        (build_dir / "environment.yml").write_text(
-            "name: test-env\nchannels: []\ndependencies: []\n",
-            encoding="utf-8",
-        )
-
-        print(f"[env_tarball] Creating tarball at {tarball_path}", flush=True)
-        with tarfile.open(tarball_path, "w:gz") as tf:
-            tf.add(build_dir, arcname=".")
-
-        assert tarball_path.exists() and tarball_path.stat().st_size > 0
-        print(f"[env_tarball] Created {tarball_path} ({tarball_path.stat().st_size} bytes)", flush=True)
-        return str(tarball_path)
-
-    finally:
-        with contextlib.suppress(Exception):
-            lock.release()
-        # Make sure the lock file is gone (filelock may keep a tiny file around)
-        with contextlib.suppress(Exception):
-            lock_path.unlink()
+    return tarball_path
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -303,126 +304,115 @@ async def env(env_tarball: str, tmp_path_factory) -> Environment:
     env_obj = await Environment.from_tarball(env_tarball, str(env_root))
     yield env_obj
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Settings
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture
 def settings() -> Settings:
+    """Base settings with small pools for speed."""
     s = _load_json_model(Settings, TESTDATA_PATH / "settings.json")
-    # keep pools small for speed
-    if not getattr(s, "parallel_workers", None):
-        s.parallel_workers = 2
-    else:
-        s.parallel_workers = min(2, s.parallel_workers)
+    s.parallel_workers = 2
     return s
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Metrics
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def metrics_registry() -> MetricsRegistry:
-    yield METRICS_REGISTRY
-    unregister_metrics(METRICS_REGISTRY)
+    """Module-scoped mlserver metrics registry."""
+    try:
+        yield METRICS_REGISTRY
+    finally:
+        unregister_metrics(METRICS_REGISTRY)
 
 
 @pytest.fixture(scope="module")
 def prometheus_registry(metrics_registry: MetricsRegistry) -> CollectorRegistry:
+    """
+    Ensure the default Prometheus registry is initialized; clean it up afterwards.
+    """
     try:
-        yield REGISTRY
+        yield PROM_DEFAULT_REGISTRY
     finally:
-        unregister_metrics(REGISTRY)
-        PrometheusMiddleware._metrics.clear()
+        unregister_metrics(PROM_DEFAULT_REGISTRY)
+        with contextlib.suppress(Exception):
+            PrometheusMiddleware._metrics.clear()
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Model settings & payloads
-# --------------------------
-@pytest.fixture(scope="module")
+# --------------------------------------------------------------------------------------
+@pytest_asyncio.fixture(scope="module")
 def sum_model_settings() -> ModelSettings:
+    """SumModel from testdata/model-settings.json."""
     return _load_json_model(ModelSettings, TESTDATA_PATH / DEFAULT_MODEL_SETTINGS_FILENAME)
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module")
 def simple_model_settings() -> ModelSettings:
-    ms = _load_json_model(ModelSettings, TESTDATA_PATH / DEFAULT_MODEL_SETTINGS_FILENAME)
-    ms.name = "simple-model"
-    ms.implementation = SimpleModel
-    return ms
+    """SimpleModel overriding name/implementation from JSON base."""
+    base = ModelSettings.parse_file(os.path.join(TESTDATA_PATH, DEFAULT_MODEL_SETTINGS_FILENAME))
+    base.name = "simple-model"
+    base.implementation = SimpleModel
+    return base
 
 
-@pytest.fixture(scope="module")
+@pytest_asyncio.fixture(scope="module")
 def error_model_settings() -> ModelSettings:
-    ms = _load_json_model(ModelSettings, TESTDATA_PATH / DEFAULT_MODEL_SETTINGS_FILENAME)
-    ms.name = "error-model"
-    ms.implementation = ErrorModel
-    return ms
+    """ErrorModel overriding name/implementation from JSON base."""
+    base = ModelSettings.parse_file(os.path.join(TESTDATA_PATH, DEFAULT_MODEL_SETTINGS_FILENAME))
+    base.name = "error-model"
+    base.implementation = ErrorModel
+    return base
 
 
 @pytest_asyncio.fixture(scope="module")
 async def model_registry(sum_model_settings: ModelSettings) -> MultiModelRegistry:
+    """MultiModelRegistry with SumModel preloaded."""
     registry = MultiModelRegistry()
     await registry.load(sum_model_settings)
-    try:
-        yield registry
-    finally:
-        for name in list(registry._models.keys()):
-            try:
-                await registry.unload(name)
-            except Exception:
-                pass
+    return registry
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="module")
 async def error_model(
     model_registry: MultiModelRegistry, error_model_settings: ModelSettings
 ) -> ErrorModel:
+    """Loaded ErrorModel."""
     await model_registry.load(error_model_settings)
     return await model_registry.get_model(error_model_settings.name)
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="module")
 async def simple_model(
     model_registry: MultiModelRegistry, simple_model_settings: ModelSettings
 ) -> SimpleModel:
+    """Loaded SimpleModel."""
     await model_registry.load(simple_model_settings)
     return await model_registry.get_model(simple_model_settings.name)
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="module")
 async def sum_model(
     model_registry: MultiModelRegistry, sum_model_settings: ModelSettings
 ) -> SumModel:
+    """Return preloaded SumModel."""
     return await model_registry.get_model(sum_model_settings.name)
 
 
 @pytest.fixture
 def text_model_settings() -> ModelSettings:
-    return ModelSettings(
-        name="text-model",
-        implementation=TextModel,
-        parallel_workers=2,
-        parameters={"version": "v1.2.3"},
-    )
+    return ModelSettings(name="text-model", implementation=TextModel, parameters={"version": "v1.2.3"})
 
 
 @pytest_asyncio.fixture
-async def text_model(
-    model_registry: MultiModelRegistry, text_model_settings: ModelSettings
-) -> TextModel:
+async def text_model(model_registry: MultiModelRegistry, text_model_settings: ModelSettings) -> TextModel:
     await model_registry.load(text_model_settings)
     return await model_registry.get_model(text_model_settings.name)
 
 
 @pytest.fixture
 def text_stream_model_settings() -> ModelSettings:
-    return ModelSettings(
-        name="text-stream-model",
-        implementation=TextStreamModel,
-        parallel_workers=2,
-        parameters={"version": "v1.2.3"},
-    )
+    return ModelSettings(name="text-stream-model", implementation=TextStreamModel, parameters={"version": "v1.2.3"})
 
 
 @pytest_asyncio.fixture
@@ -432,10 +422,9 @@ async def text_stream_model(
     await model_registry.load(text_stream_model_settings)
     return await model_registry.get_model(text_stream_model_settings.name)
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Static payload fixtures
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture
 def metadata_server_response() -> types.MetadataServerResponse:
     return _load_json_model(types.MetadataServerResponse, TESTDATA_PATH / "metadata-server-response.json")
@@ -466,34 +455,32 @@ def inference_request_invalid_datatype() -> dict[str, Any]:
 def inference_response() -> types.InferenceResponse:
     return _load_json_model(types.InferenceResponse, TESTDATA_PATH / "inference-response.json")
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Server / repository
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
-def _mlserver_settings(tmp_path_factory: pytest.TempPathFactory):
+def _woprserver_settings(tmp_path_factory: pytest.TempPathFactory) -> Settings:
+    """Module-scoped mlserver Settings with unique ports & metrics dir."""
     s = _load_json_model(Settings, TESTDATA_PATH / "settings.json")
     http_port, grpc_port, metrics_port = get_available_ports(3)
     s.http_port = http_port
     s.grpc_port = grpc_port
     s.metrics_port = metrics_port
     s.metrics_dir = str(tmp_path_factory.mktemp("metrics_mod"))
-    # keep small for speed
-    if not getattr(s, "parallel_workers", None):
-        s.parallel_workers = 2
-    else:
-        s.parallel_workers = min(2, s.parallel_workers)
+    s.parallel_workers = 2
     return s
 
 
 @pytest_asyncio.fixture(scope="module")
 async def mlserver(
-    _mlserver_settings: Settings,
+    _woprserver_settings: Settings,
     sum_model_settings: ModelSettings,
     prometheus_registry: CollectorRegistry,  # force init
 ):
-    from mlserver import MLServer
-    server = MLServer(_mlserver_settings)
+    """Boot an MLServer instance for integration tests."""
+    from woprserver.server import WOPRserver
+
+    server = WOPRserver(_woprserver_settings)
     task = asyncio.create_task(server.start())
     await server._model_registry.load(sum_model_settings)
     try:
@@ -501,29 +488,30 @@ async def mlserver(
     finally:
         await server.stop()
         await task
-        prom_files = glob.glob(os.path.join(_mlserver_settings.metrics_dir, "*.db"))
+        # ensure starlette-exporter files are cleaned
+        prom_files = glob.glob(os.path.join(_woprserver_settings.metrics_dir, "*.db"))
         assert not prom_files
 
 
-@pytest_asyncio.fixture
-async def rest_client(mlserver, _mlserver_settings: Settings):
-    http_server = f"{_mlserver_settings.host}:{_mlserver_settings.http_port}"
-    client = RESTClient(http_server)
-    try:
-        yield client
-    finally:
-        await client.close()
+@pytest.fixture
+def data_plane(model_registry: MultiModelRegistry, prometheus_registry: CollectorRegistry) -> DataPlane:
+    """DataPlane backed by the shared model registry."""
+    return DataPlane(settings=_load_json_model(Settings, TESTDATA_PATH / "settings.json"), model_registry=model_registry)
 
 
 @pytest.fixture
-def data_plane(
-    model_registry: MultiModelRegistry,
-    prometheus_registry: CollectorRegistry,
-) -> DataPlane:
-    return DataPlane(
-        settings=_load_json_model(Settings, TESTDATA_PATH / "settings.json"),
-        model_registry=model_registry,
-    )
+def model_folder(tmp_path: str) -> str:
+    """Temporary model folder containing a single model-settings file."""
+    src = TESTDATA_PATH / DEFAULT_MODEL_SETTINGS_FILENAME
+    dst = Path(tmp_path) / DEFAULT_MODEL_SETTINGS_FILENAME
+    shutil.copyfile(src, dst)
+    return str(Path(tmp_path))
+
+
+@pytest.fixture
+def model_repository(model_folder: str) -> ModelRepository:
+    """Schemaless repository pointing at `model_folder`."""
+    return SchemalessModelRepository(model_folder)
 
 
 @pytest.fixture
@@ -534,25 +522,12 @@ def model_repository_handlers(
 
 
 @pytest.fixture
-def model_folder(tmp_path: str) -> str:
-    src = TESTDATA_PATH / DEFAULT_MODEL_SETTINGS_FILENAME
-    dst = Path(tmp_path) / DEFAULT_MODEL_SETTINGS_FILENAME
-    shutil.copyfile(src, dst)
-    return str(Path(tmp_path))
-
-
-@pytest.fixture
-def model_repository(model_folder: str) -> ModelRepository:
-    return SchemalessModelRepository(model_folder)
-
-
-@pytest.fixture
 def repository_index_request() -> types.RepositoryIndexRequest:
     return types.RepositoryIndexRequest(ready=None)
 
 
 @pytest.fixture
-def repository_index_response(sum_model_settings) -> types.RepositoryIndexResponse:
+def repository_index_response(sum_model_settings: ModelSettings) -> types.RepositoryIndexResponse:
     return types.RepositoryIndexResponse(
         root=[
             types.RepositoryIndexResponseItem(
@@ -564,16 +539,15 @@ def repository_index_response(sum_model_settings) -> types.RepositoryIndexRespon
         ]
     )
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Inference pool / dispatcher (module-scoped)
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest_asyncio.fixture(scope="module")
 async def inference_pool_registry(
-    _mlserver_settings: Settings,
-    prometheus_registry: CollectorRegistry,
+    _woprserver_settings: Settings, prometheus_registry: CollectorRegistry
 ) -> InferencePoolRegistry:
-    reg = InferencePoolRegistry(_mlserver_settings)
+    """Shared InferencePoolRegistry; ensure close on teardown."""
+    reg = InferencePoolRegistry(_woprserver_settings)
     try:
         yield reg
     finally:
@@ -581,9 +555,10 @@ async def inference_pool_registry(
 
 
 @pytest_asyncio.fixture(scope="module")
-async def inference_pool(_mlserver_settings: Settings) -> InferencePool:
-    configure_inference_pool(_mlserver_settings)
-    pool = InferencePool(_mlserver_settings)
+async def inference_pool(_woprserver_settings: Settings) -> InferencePool:
+    """Shared InferencePool configured with tiny worker pool for speed."""
+    configure_inference_pool(_woprserver_settings)
+    pool = InferencePool(_woprserver_settings)
     try:
         yield pool
     finally:
@@ -592,14 +567,15 @@ async def inference_pool(_mlserver_settings: Settings) -> InferencePool:
 
 @pytest.fixture(scope="module")
 def dispatcher(inference_pool: InferencePool) -> Dispatcher:
+    """Dispatcher grabbed from the shared pool."""
     return inference_pool._dispatcher
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Models routed via the pool
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest_asyncio.fixture
 async def loaded_error_model(inference_pool: InferencePool) -> MLModel:
+    """Load & unload ErrorModel through the pool for routing tests."""
     error_settings = ModelSettings(name="error-model", implementation=ErrorModel, parameters=ModelParameters())
     model = ErrorModel(error_settings)
     _ = await inference_pool.load_model(model)
@@ -608,12 +584,12 @@ async def loaded_error_model(inference_pool: InferencePool) -> MLModel:
     finally:
         await inference_pool.unload_model(model)
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Worker-process helpers (module scoped)
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest_asyncio.fixture(scope="module")
 async def responses():
+    """Multiprocessing queue used to receive worker responses."""
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     try:
@@ -624,13 +600,15 @@ async def responses():
 
 @pytest_asyncio.fixture(scope="module")
 async def worker(
-    _mlserver_settings: Settings,
+    _woprserver_settings: Settings,
     responses,
     load_message: ModelUpdateMessage,
 ) -> Worker:
-    worker = Worker(_mlserver_settings, responses)
+    """Spawn a Worker, load a model, and ensure clean shutdown."""
+    worker = Worker(_woprserver_settings, responses)
     task = asyncio.create_task(worker.coro_run())
 
+    # Signal load; wait until worker reports back
     loop = asyncio.get_running_loop()
     worker.send_update(load_message)
     await loop.run_in_executor(None, lambda: responses.get(timeout=10))
@@ -641,10 +619,9 @@ async def worker(
         await worker.stop()
         await cancel_task(task)
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Messages
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture
 def load_message(sum_model_settings: ModelSettings) -> ModelUpdateMessage:
     return ModelUpdateMessage(update_type=ModelUpdateType.Load, model_settings=sum_model_settings)
@@ -656,9 +633,7 @@ def unload_message(sum_model_settings: ModelSettings) -> ModelUpdateMessage:
 
 
 @pytest.fixture
-def inference_request_message(
-    sum_model_settings: ModelSettings, inference_request: InferenceRequest
-) -> ModelRequestMessage:
+def inference_request_message(sum_model_settings: ModelSettings, inference_request: InferenceRequest) -> ModelRequestMessage:
     return ModelRequestMessage(
         model_name=sum_model_settings.name,
         model_version=sum_model_settings.parameters.version,
@@ -685,17 +660,22 @@ def custom_request_message(sum_model_settings: ModelSettings) -> ModelRequestMes
         method_kwargs={"payload": [1, 2, 3]},
     )
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Parallel model unit helpers
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture
 def parallel_model_settings() -> ModelSettings:
-    return ModelSettings(name="dummy-parallel-model", implementation="tests.parallel.fixtures.SumModel", parameters={"version": "v0"})
+    return ModelSettings(
+        name="dummy-parallel-model",
+        implementation="tests.parallel.fixtures.SumModel",
+        parameters={"version": "v0"},
+    )
 
 
 @pytest.fixture
 def inner_model(parallel_model_settings: ModelSettings) -> MLModel:
+    """Minimal MLModel to exercise ParallelModel behavior in isolation."""
+
     class Dummy(MLModel):
         async def load(self) -> None:
             return
@@ -723,10 +703,9 @@ def inner_model(parallel_model_settings: ModelSettings) -> MLModel:
 def parallel(inner_model: MLModel, dispatcher: Dispatcher) -> ParallelModel:
     return ParallelModel(inner_model, dispatcher)
 
-
-# --------------------------
+# --------------------------------------------------------------------------------------
 # Environment-model helpers (used by env tests)
-# --------------------------
+# --------------------------------------------------------------------------------------
 @pytest.fixture
 def env_model_settings(env_tarball: str) -> ModelSettings:
     return ModelSettings(
@@ -738,6 +717,7 @@ def env_model_settings(env_tarball: str) -> ModelSettings:
 
 @pytest.fixture
 def existing_env_model_settings(env_tarball: str, tmp_path) -> ModelSettings:
+    """ModelSettings pointing at a pre-extracted env path."""
     from mlserver.env import _extract_env
 
     env_path = str(tmp_path)
@@ -751,14 +731,14 @@ def existing_env_model_settings(env_tarball: str, tmp_path) -> ModelSettings:
 
 @pytest_asyncio.fixture(scope="module")
 async def worker_with_env(
-    _mlserver_settings: Settings,
+    _woprserver_settings: Settings,
     responses,
     env: Environment,
     env_model_settings: ModelSettings,
 ):
-    worker = _spawn_worker(_mlserver_settings, responses, env)
-    load_msg = ModelUpdateMessage(update_type=ModelUpdateType.Load, model_settings=env_model_settings)
-    worker.send_update(load_msg)
+    """Spawn a worker with a pre-provisioned Environment attached."""
+    worker = _spawn_worker(_woprserver_settings, responses, env)
+    worker.send_update(ModelUpdateMessage(update_type=ModelUpdateType.Load, model_settings=env_model_settings))
 
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: responses.get(timeout=10))
@@ -767,12 +747,11 @@ async def worker_with_env(
     finally:
         await worker.stop()
 
-
-# --------------------------
-# Misc
-# --------------------------
+# --------------------------------------------------------------------------------------
+# Misc small fixtures
+# --------------------------------------------------------------------------------------
 @pytest.fixture
-def datatype_error_message():
+def datatype_error_message() -> str:
     return (
         "Input should be"
         " 'BOOL', 'UINT8', 'UINT16', 'UINT32',"
@@ -785,8 +764,8 @@ def datatype_error_message():
 async def env_model(
     inference_pool_registry: InferencePoolRegistry, env_model_settings: ModelSettings
 ) -> MLModel:
-    env_model = EnvModel(env_model_settings)
-    model = await inference_pool_registry.load_model(env_model)
+    """EnvModel loaded via the InferencePoolRegistry."""
+    model = await inference_pool_registry.load_model(EnvModel(env_model_settings))
     try:
         yield model
     finally:
@@ -795,11 +774,10 @@ async def env_model(
 
 @pytest_asyncio.fixture
 async def existing_env_model(
-    inference_pool_registry: InferencePoolRegistry,
-    existing_env_model_settings: ModelSettings,
+    inference_pool_registry: InferencePoolRegistry, existing_env_model_settings: ModelSettings
 ) -> MLModel:
-    env_model = EnvModel(existing_env_model_settings)
-    model = await inference_pool_registry.load_model(env_model)
+    """EnvModel with a pre-extracted env."""
+    model = await inference_pool_registry.load_model(EnvModel(existing_env_model_settings))
     try:
         yield model
     finally:
@@ -808,22 +786,12 @@ async def existing_env_model(
 
 @pytest.fixture
 def pid_unary_settings() -> ModelSettings:
-    return ModelSettings(
-        name="pid-unary",
-        implementation=PidUnaryModel,
-        parallel_workers=2,
-        parameters={"version": "v-test"},
-    )
+    return ModelSettings(name="pid-unary", implementation=PidUnaryModel, parallel_workers=2, parameters={"version": "v-test"})
 
 
 @pytest.fixture
 def pid_stream_settings() -> ModelSettings:
-    return ModelSettings(
-        name="pid-stream",
-        implementation=PidStreamModel,
-        parallel_workers=2,
-        parameters={"version": "v-test"},
-    )
+    return ModelSettings(name="pid-stream", implementation=PidStreamModel, parallel_workers=2, parameters={"version": "v-test"})
 
 
 @pytest.fixture
@@ -833,16 +801,14 @@ def trivial_req() -> InferenceRequest:
 
 @pytest_asyncio.fixture
 async def load_error_model() -> MLModel:
-    ms = ModelSettings(
-        name="error-model-temp",
-        implementation=ErrorModel,
-        parameters=ModelParameters(load_error=True),
-    )
+    """An ErrorModel configured to raise during load, for negative tests."""
+    ms = ModelSettings(name="error-model-temp", implementation=ErrorModel, parameters=ModelParameters(load_error=True))
     yield ErrorModel(ms)
+
 
 @pytest_asyncio.fixture
 async def inference_pool_pid(settings: Settings):
-    # Dedicated pool for the PID routing tests
+    """Dedicated pool for the PID routing tests."""
     configure_inference_pool(settings)
     pool = InferencePool(settings)
     try:
@@ -859,18 +825,17 @@ async def rest_server(
     sum_model: SumModel,
     prometheus_registry: CollectorRegistry,
 ) -> RESTServer:
-    server = RESTServer(
-        settings,
-        data_plane=data_plane,
-        model_repository_handlers=model_repository_handlers,
-    )
-
+    """RESTServer with SumModel custom handlers mounted, auto-cleanup."""
+    server = RESTServer(settings, data_plane=data_plane, model_repository_handlers=model_repository_handlers)
     sum_model = await server.add_custom_handlers(sum_model)
+    try:
+        yield server
+    finally:
+        await server.delete_custom_handlers(sum_model)
 
-    yield server
-
-    await server.delete_custom_handlers(sum_model)
-
+# --------------------------------------------------------------------------------------
+# Global Prometheus hygiene
+# --------------------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _prometheus_isolated_between_tests():
     """
@@ -880,28 +845,23 @@ def _prometheus_isolated_between_tests():
     """
     yield
     reg = prometheus_client.REGISTRY  # default global registry
-    try:
+    with contextlib.suppress(Exception):
         collectors = list(getattr(reg, "_collector_to_names", {}).keys())
         for c in collectors:
-            try:
+            with contextlib.suppress(Exception):
                 reg.unregister(c)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):
         PrometheusMiddleware._metrics.clear()
-    except Exception:
-        pass
 
-
+# --------------------------------------------------------------------------------------
+# ParallelModel baseline
+# --------------------------------------------------------------------------------------
 @pytest.fixture
 def pm_and_dispatcher(mocker):
+    """ParallelModel + dummy dispatcher, with custom handlers explicitly disabled."""
     model = FakeModel()
     dispatcher = make_dispatcher()
     pm = ParallelModel(model, dispatcher)
-    # Ensure no custom handlers are added for this baseline fixture.
     mocker.patch("woprserver.parallel.model.get_custom_handlers", return_value=[])
     pm._register_custom_handlers()
     return pm, dispatcher, model
-

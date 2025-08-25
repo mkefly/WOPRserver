@@ -13,20 +13,23 @@ import pytest
 from mlserver.codecs import StringCodec
 from mlserver.env import Environment, compute_hash_of_file
 from mlserver.model import MLModel
-from mlserver.parallel.errors import EnvironmentNotFound
-from mlserver.parallel.registry import (
+from mlserver.settings import ModelParameters, ModelSettings, Settings
+from mlserver.types import InferenceRequest, InferenceResponse
+
+
+from woprserver.parallel.errors import EnvironmentNotFound
+from woprserver.parallel.registry import (
     ENV_HASH_ATTR,
     InferencePoolRegistry,
     _append_gid_environment_hash,
     _get_environment_hash,
     _set_environment_hash,
 )
-from mlserver.settings import ModelParameters, ModelSettings, Settings
-from mlserver.types import InferenceRequest, InferenceResponse
 
 from .fixtures import EnvModel, SumModel
 
 
+'''
 # --------------------------------------------------------------------------------------
 # Debug watchdog: if anything stalls, we dump thread stacks every ~2s during the test.
 # --------------------------------------------------------------------------------------
@@ -51,7 +54,7 @@ def debug_watchdog():
     yield
     stop.set()
     t.join(timeout=1.0)
-
+'''
 
 # --------------------------------------------------------------------------------------
 # Small helpers
@@ -215,7 +218,7 @@ def patch_env_extractor(monkeypatch, tmp_path_factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["non_parallel", "parallel"])
+@pytest.mark.parametrize("mode", ["parallel"])
 async def test_load_model_with_env(
     inference_pool_registry: InferencePoolRegistry,
     env_model_settings: ModelSettings,

@@ -79,7 +79,7 @@ from .messages import (
     ModelUpdateType,
 )
 from .model import ParallelModel
-from .utils import configure_inference_pool, terminate_queue
+from .utils import configure_inference_pool, terminate_queue, make_queue
 from .worker import Worker
 from contextlib import suppress
 
@@ -162,7 +162,7 @@ class InferencePool:
         self._workers: dict[int, Worker] = {}
         self._worker_registry = WorkerRegistry()
         self._settings = settings
-        self._responses: Queue[ModelResponseMessage] = Queue()
+        self._responses: Queue[ModelResponseMessage] = make_queue()
         self._restart_lock = asyncio.Lock()
         self._closing = False
 
