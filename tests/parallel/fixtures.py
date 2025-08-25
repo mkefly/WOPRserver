@@ -25,6 +25,45 @@ from mlserver.types import (
     ResponseOutput,
 )
 from mlserver.utils import generate_uuid
+# tests/conftest.py
+import os
+import warnings
+import psutil
+import pytest
+
+
+@pytest.fixture(autouse=True, scope="session")
+def warn_if_micromamba_hanging():
+    """
+    Session-wide fixture: check for existing micromamba processes or stale locks.
+    If found, raise a pytest warning so tests don't silently hang.
+    """
+    hanging_procs = [
+        p for p in psutil.process_iter(["pid", "name", "cmdline"])
+        if "micromamba" in (p.info.get("name") or "")
+        or any("micromamba" in part for part in (p.info.get("cmdline") or []))
+    ]
+
+    if hanging_procs:
+        warnings.warn(
+            f"Detected {len(hanging_procs)} running micromamba process(es): "
+            + ", ".join(f"pid={p.pid}" for p in hanging_procs)
+            + " — tests that pack/unpack environments may hang until they are killed.",
+            RuntimeWarning,
+        )
+
+    # Also check for stale lock files in ~/.mamba/pkgs/locks
+    lock_dir = os.path.expanduser("~/.mamba/pkgs/locks")
+    if os.path.isdir(lock_dir):
+        locks = [f for f in os.listdir(lock_dir) if not f.startswith(".")]
+        if locks:
+            warnings.warn(
+                f"Stale micromamba lock files detected in {lock_dir}: {locks}. "
+                "Tests may hang until these are cleaned up.",
+                RuntimeWarning,
+            )
+
+    yield
 
 
 class SumModel(MLModel):
@@ -129,16 +168,16 @@ class SlowModel(MLModel):
 
 
 class EnvModel(MLModel):
-    async def load(self):
-        # Optional dependency available in custom env
-        import sklearn
-        self._sklearn_version = sklearn.__version__ if sklearn else "missing"
+    async def load(self) -> bool:
+        # Nothing special — worker/pool already gave us the right env.
         return True
 
     async def predict(self, payload: InferenceRequest) -> InferenceResponse:
+        import sklearn  # <-- this import is resolved inside the worker’s env
+        version = sklearn.__version__
         return InferenceResponse(
             model_name=self.name,
-            outputs=[StringCodec.encode_output("sklearn_version", [self._sklearn_version])],
+            outputs=[StringCodec.encode_output("sklearn_version", [version])],
         )
 
 

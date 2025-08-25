@@ -825,12 +825,13 @@ def datatype_error_message() -> str:
 async def env_model(
     inference_pool_registry: InferencePoolRegistry, env_model_settings: ModelSettings
 ) -> MLModel:
-    """EnvModel loaded via the InferencePoolRegistry."""
-    model = await inference_pool_registry.load_model(EnvModel(env_model_settings))
-    try:
-        yield model
-    finally:
-        await inference_pool_registry.unload_model(model)
+    env_model = EnvModel(env_model_settings)
+    model = await inference_pool_registry.load_model(env_model)
+
+    yield model
+
+    await inference_pool_registry.unload_model(model)
+
 
 
 @pytest_asyncio.fixture
