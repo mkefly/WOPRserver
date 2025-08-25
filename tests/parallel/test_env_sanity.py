@@ -29,11 +29,26 @@ from woprserver.parallel.messages import (
 from woprserver.parallel.model import ModelMethods
 
 from .fixtures import EnvModel
+import contextlib
+
+import pytest
+import asyncio
+
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+async def _cleanup_pending_tasks():
+    yield
+    # After each test, cancel leftover tasks like Dispatcher._observe_ack
+    tasks = [t for t in asyncio.all_tasks() if not t.done()]
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
 
 def _extract_tarball(src: str, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)

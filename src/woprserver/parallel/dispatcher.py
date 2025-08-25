@@ -197,14 +197,23 @@ class Dispatcher:
         logger.debug("Starting response processing loop...")
         loop = asyncio.get_event_loop()
         while self._active:
-            # Offload blocking Queue.get() onto a thread to avoid stalling the loop.
-            response = await loop.run_in_executor(self._executor, self._responses.get)
+            try:
+                # If executor is gone, exit quietly
+                if self._executor is None or getattr(self._executor, "_shutdown", False):
+                    return
+
+                response = await loop.run_in_executor(self._executor, self._responses.get)
+            except RuntimeError as e:
+                if "after shutdown" in str(e):
+                    return  # normal shutdown
+                raise
             if response is END_OF_QUEUE:
                 return
             if isinstance(response, (ModelStreamChunkMessage, ModelStreamEndMessage)):
                 self._async_responses.put_stream_message(response)
                 continue
             self._async_responses.resolve(response)
+
 
     async def dispatch_request(self, request_message: ModelRequestMessage) -> ModelResponseMessage:
         """Send a unary request to the next worker and await its response.
@@ -345,6 +354,14 @@ class Dispatcher:
         pending ``Queue.get`` calls, and the response loop task is cancelled via
         ``cancel_task`` helper.
         """
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._active = False
+
+        # Cancel the response task *before* shutting down executor
         if self._process_responses_task is not None:
             await cancel_task(self._process_responses_task)
+            self._process_responses_task = None
+
+        # Now it is safe to close executor
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None

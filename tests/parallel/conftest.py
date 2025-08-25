@@ -177,22 +177,7 @@ Mock.assert_not_called_with = assert_not_called_with  # monkey-patch for tests
 @pytest.fixture(scope="session")
 def event_loop():
     loop = uvloop.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        yield loop
-    finally:
-        # Cancel any pending tasks to avoid shutdown hangs
-        pending = asyncio.all_tasks(loop)
-        for t in pending:
-            t.cancel()
-        with contextlib.suppress(Exception):
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        with contextlib.suppress(Exception):
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        # Python 3.9+
-        with contextlib.suppress(AttributeError, RuntimeError):
-            loop.run_until_complete(loop.shutdown_default_executor())
-        loop.close()
+    yield loop
 
 # --------------------------------------------------------------------------------------
 # Caching / env tarballs
