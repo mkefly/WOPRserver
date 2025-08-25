@@ -1,42 +1,31 @@
-# worker.py
-# Rewritten end-to-end: DRY helpers for request decoding & unary result coercion,
-# preserved streaming, metrics, and lifecycle behavior.
+# Strict Worker (no implicit coercion)
+# - Removes _coerce_to_inference_response
+# - Enforces that predict() returns an InferenceResponse (non-streaming)
+# - Keeps streaming, input-channel bridging, metrics, and graceful shutdown
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import os
+import re
 import signal
 import threading
 import time
+import uuid
 from asyncio import CancelledError, Task
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import Process, Queue
-from typing import Any, AsyncIterator, Optional
-import contextlib
+from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np
-from prometheus_client import REGISTRY as PROM_REGISTRY
-from prometheus_client import Counter, Gauge, Histogram
+import numpy as np  # only used by model authors; safe to import for type hints/compat
 
-from mlserver.context import model_context
-from mlserver.env import Environment
-
-from mlserver.metrics import configure_metrics
-from mlserver.registry import MultiModelRegistry
-from mlserver.settings import Settings
-from mlserver.types import InferenceRequest, InferenceResponse
-from mlserver.utils import install_uvloop_event_loop, schedule_with_callback, generate_uuid
-from mlserver.codecs.numpy import NumpyCodec
-
+from ..logging import configure_logger, get_logger
 from .errors import WorkerError
-from ..logging import configure_logger, get_logger 
-logger = get_logger()
-
 from .messages import (
     InputChannelRef,
     ModelRequestMessage,
@@ -48,88 +37,132 @@ from .messages import (
     ModelUpdateMessage,
     ModelUpdateType,
 )
-from .utils import END_OF_QUEUE, terminate_queue, make_queue
+from .utils import END_OF_QUEUE, make_queue, terminate_queue
+
+if TYPE_CHECKING:
+    from mlserver.env import Environment
+    from mlserver.settings import Settings
+    from mlserver.types import InferenceResponse  # for isinstance checks / annotations
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+logger = get_logger()
 
 # -----------------------------------------------------------------------------
 # Config & Metrics
 # -----------------------------------------------------------------------------
 
 _ENABLE_METRICS = os.getenv("WORKER_METRICS", "1") not in ("0", "false", "False", "")
-IGNORED_SIGNALS = [signal.SIGINT, signal.SIGTERM] + ([signal.SIGQUIT] if hasattr(signal, "SIGQUIT") else [])
+IGNORED_SIGNALS = [signal.SIGINT, signal.SIGTERM] + (
+    [signal.SIGQUIT] if hasattr(signal, "SIGQUIT") else []
+)
 _UNKNOWN = "unknown"  # Single literal for unknown identifiers
 
 
 class _NoOpMetric:
     """No-op metric used when Prometheus metrics are disabled."""
-    def labels(self, *_, **__): return self
-    def inc(self, *_a, **_k): pass
-    def dec(self, *_a, **_k): pass
-    def observe(self, *_a, **_k): pass
-    def set(self, *_a, **_k): pass
+
+    def labels(self, *_, **__):
+        return self
+
+    def inc(self, *_a, **_k):
+        pass
+
+    def dec(self, *_a, **_k):
+        pass
+
+    def observe(self, *_a, **_k):
+        pass
+
+    def set(self, *_a, **_k):
+        pass
 
 
 class _Metrics:
     """
     Lazily-initialized metrics container. Falls back to no-op metrics when
-    WORKER_METRICS is disabled. Ensures a single set of metric objects per process.
+    WORKER_METRICS is disabled or Prometheus import fails.
+    Ensures a single set of metric objects per process.
     """
+
     _inited = False
+
     def __init__(self) -> None:
         if _Metrics._inited:
             return
+
         if not _ENABLE_METRICS:
-            self.requests_total = _NoOpMetric()
-            self.request_exceptions_total = _NoOpMetric()
-            self.request_latency_seconds = _NoOpMetric()
-            self.stream_chunks_total = _NoOpMetric()
-            self.stream_errors_total = _NoOpMetric()
-            self.active_streams = _NoOpMetric()
-            self.model_updates_total = _NoOpMetric()
-            _Metrics._inited = True
+            self._init_noop()
             return
 
-        self.requests_total = Counter(
-            "worker_requests_total",
-            "Total requests processed by a worker.",
-            ["model", "method"],
-            registry=PROM_REGISTRY,
-        )
-        self.request_exceptions_total = Counter(
-            "worker_request_exceptions_total",
-            "Total exceptions raised while processing requests.",
-            ["model", "method"],
-            registry=PROM_REGISTRY,
-        )
-        self.request_latency_seconds = Histogram(
-            "worker_request_latency_seconds",
-            "End-to-end request latency per method.",
-            ["model", "method"],
-            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
-            registry=PROM_REGISTRY,
-        )
-        self.stream_chunks_total = Counter(
-            "worker_stream_chunks_total",
-            "Number of chunks emitted by streaming responses.",
-            ["model", "method"],
-            registry=PROM_REGISTRY,
-        )
-        self.stream_errors_total = Counter(
-            "worker_stream_errors_total",
-            "Number of streaming errors.",
-            ["model", "method"],
-            registry=PROM_REGISTRY,
-        )
-        self.active_streams = Gauge(
-            "worker_active_streams",
-            "Number of active server->client streams.",
-            registry=PROM_REGISTRY,
-        )
-        self.model_updates_total = Counter(
-            "worker_model_updates_total",
-            "Model updates applied by the worker.",
-            ["type", "outcome"],
-            registry=PROM_REGISTRY,
-        )
+        try:  # tolerate envs where prometheus_client isn't available
+            from prometheus_client import REGISTRY as PROM_REGISTRY  # type: ignore
+            from prometheus_client import Counter, Gauge, Histogram  # type: ignore
+        except Exception as e:  # pragma: no cover
+            logger.warning("Prometheus disabled (import error): %s", e)
+            self._init_noop()
+            return
+
+        try:
+            self.requests_total = Counter(
+                "worker_requests_total",
+                "Total requests processed by a worker.",
+                ["model", "method"],
+                registry=PROM_REGISTRY,
+            )
+            self.request_exceptions_total = Counter(
+                "worker_request_exceptions_total",
+                "Total exceptions raised while processing requests.",
+                ["model", "method"],
+                registry=PROM_REGISTRY,
+            )
+            self.request_latency_seconds = Histogram(
+                "worker_request_latency_seconds",
+                "End-to-end request latency per method.",
+                ["model", "method"],
+                buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+                registry=PROM_REGISTRY,
+            )
+            self.stream_chunks_total = Counter(
+                "worker_stream_chunks_total",
+                "Number of chunks emitted by streaming responses.",
+                ["model", "method"],
+                registry=PROM_REGISTRY,
+            )
+            self.stream_errors_total = Counter(
+                "worker_stream_errors_total",
+                "Number of streaming errors.",
+                ["model", "method"],
+                registry=PROM_REGISTRY,
+            )
+            self.active_streams = Gauge(
+                "worker_active_streams",
+                "Number of active server->client streams.",
+                registry=PROM_REGISTRY,
+            )
+            self.model_updates_total = Counter(
+                "worker_model_updates_total",
+                "Model updates applied by the worker.",
+                ["type", "outcome"],
+                registry=PROM_REGISTRY,
+            )
+        except Exception as e:  # pragma: no cover
+            logger.warning("Prometheus disabled (metric init error): %s", e)
+            self._init_noop()
+            return
+
+        _Metrics._inited = True
+
+    def _init_noop(self) -> None:
+        self.requests_total = _NoOpMetric()
+        self.request_exceptions_total = _NoOpMetric()
+        self.request_latency_seconds = _NoOpMetric()
+        self.stream_chunks_total = _NoOpMetric()
+        self.stream_errors_total = _NoOpMetric()
+        self.active_streams = _NoOpMetric()
+        self.model_updates_total = _NoOpMetric()
         _Metrics._inited = True
 
 
@@ -145,6 +178,7 @@ def _noop() -> None:
 # Internal outcomes (single return point)
 # -----------------------------------------------------------------------------
 
+
 @dataclass
 class _Outcome:
     """
@@ -155,14 +189,39 @@ class _Outcome:
         return_value: Result value (None for streaming ACKs).
         exception: WorkerError if an exception occurred.
     """
+
     id: str
     return_value: Any | None = None
     exception: WorkerError | None = None
 
 
 # -----------------------------------------------------------------------------
-# DRY helpers: discovery, decoding & post-processing
+# Small local helpers (to avoid importing mlserver at module load)
 # -----------------------------------------------------------------------------
+
+
+def _schedule_with_callback(coro: Any, cb: Any) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    task.add_done_callback(cb)
+    return task
+
+
+def _uuid() -> str:
+    return uuid.uuid4().hex
+
+
+def _sanitize_sys_version() -> None:
+    """Best-effort: strip vendor tags like \"| packaged by conda-forge |\"."""
+    try:
+        import sys
+
+        if "packaged by conda-forge" in sys.version:
+            sys.version = re.sub(
+                r"\s*\|\s*packaged by conda-forge\s*\|\s*", " ", sys.version
+            )
+    except Exception:
+        pass
+
 
 def _is_stream_like(value: Any) -> bool:
     """Return True if the value behaves like a stream or an awaitable."""
@@ -174,31 +233,72 @@ def _is_stream_like(value: Any) -> bool:
         or inspect.isawaitable(value)
     )
 
+# Replace your current _should_decode_request with this version
 
 def _should_decode_request(method: Any, args: list[Any]) -> bool:
     """
-    True when we're about to pass a single InferenceRequest to a method that
-    *doesn't* accept InferenceRequest (i.e., expects typed parameters).
+    Decide whether to decode a single InferenceRequest into typed args.
+    Robust to postponed annotations (PEP 563 / __future__.annotations) and
+    ForwardRefs. Be conservative: if we cannot determine the annotation,
+    do NOT decode.
     """
-    if not (len(args) == 1 and isinstance(args[0], InferenceRequest)):
+    if len(args) != 1:
         return False
+
+    try:
+        from mlserver.types import InferenceRequest as _IR  # lazy
+    except Exception:
+        return False
+
+    # Only consider decoding if the single arg we have IS an InferenceRequest
+    if not isinstance(args[0], _IR):
+        return False
+
     try:
         sig = inspect.signature(method)
         params = [p for p in sig.parameters.values() if p.name != "self"]
         if not params:
             return False
-        if len(params) == 1:
-            # one param: only decode if that param is NOT an InferenceRequest
-            ann = params[0].annotation
-            return ann not in (InferenceRequest, inspect._empty)
-        # multiple params -> likely a typed signature (foo, bar, ...)
-        return True
+
+        # If method has multiple params (excl self), it's a typed signature -> decode
+        if len(params) > 1:
+            return True
+
+        # Exactly one param: check whether it's annotated as InferenceRequest
+        p = params[0]
+        ann = p.annotation
+
+        # Try to resolve string/ForwardRef annotations into real types
+        try:
+            from typing import get_type_hints
+            hints = get_type_hints(method, globalns=getattr(method, "__globals__", {}))
+            resolved = hints.get(p.name, ann)
+        except Exception:
+            resolved = ann
+
+        def _ann_is_ir(a: Any) -> bool:
+            if a is _IR:
+                return True
+            # ForwardRef or string
+            name = None
+            if isinstance(a, str):
+                name = a
+            else:
+                name = getattr(a, "__forward_arg__", None) or getattr(a, "__name__", None)
+            if isinstance(name, str):
+                return name.split(".")[-1] == "InferenceRequest"
+            return False
+
+        # Decode only if the parameter is NOT an InferenceRequest
+        return not _ann_is_ir(resolved)
+
     except Exception:
-        # if we can't inspect, be conservative and don't decode
+        # If anything is ambiguous, DON'T decode (pass the InferenceRequest through)
         return False
 
-
-def _decode_request_args_for(method: Any, request: InferenceRequest, model: Any) -> tuple[list[Any], dict[str, Any]]:
+def _decode_request_args_for(
+    method: Any, request: "InferenceRequest", model: Any
+) -> tuple[list[Any], dict[str, Any]]:
     """
     Version-agnostic decoder:
     - Tries to map RequestInput by parameter name.
@@ -206,13 +306,12 @@ def _decode_request_args_for(method: Any, request: InferenceRequest, model: Any)
     - Always decodes via model.decode(input).
     """
     inputs = request.inputs or []
-    by_name = {ri.name: ri for ri in inputs if getattr(ri, "name", None)}
+    by_name = {getattr(ri, "name", None): ri for ri in inputs if getattr(ri, "name", None)}
 
     try:
         sig = inspect.signature(method)
         params = [p for p in sig.parameters.values() if p.name != "self"]
     except Exception:
-        # Fallback: just decode in order
         return [model.decode(ri) for ri in inputs], {}
 
     decoded: list[Any] = []
@@ -229,7 +328,7 @@ def _decode_request_args_for(method: Any, request: InferenceRequest, model: Any)
             except ValueError:
                 pass
         else:
-            decoded.append(None)  # placeholder to fill by index later
+            decoded.append(None)  # placeholder
 
     # second pass: fill remaining by index order
     it = (i for i, _ in enumerate(inputs) if i not in used_idxs)
@@ -238,51 +337,12 @@ def _decode_request_args_for(method: Any, request: InferenceRequest, model: Any)
             try:
                 idx = next(it)
             except StopIteration:
-                raise WorkerError(ValueError("Not enough inputs to satisfy method parameters"))
+                raise WorkerError(
+                    ValueError("Not enough inputs to satisfy method parameters")
+                )
             decoded[i] = model.decode(inputs[idx])
 
     return decoded, {}
-
-
-def _coerce_to_inference_response(value: Any, model_name: str, method_name: str) -> InferenceResponse | None:
-    """
-    For unary results, optionally coerce plain returns into an InferenceResponse.
-    We only coerce for `predict`, to avoid surprising other methods.
-    """
-    if method_name != "predict":
-        return None
-
-    # Already correct
-    if isinstance(value, InferenceResponse):
-        return value
-
-    def _enc(name: str, arr_like: Any):
-        return NumpyCodec.encode_output(name, np.asarray(arr_like))
-
-    # Single array-like -> one output
-    if isinstance(value, (np.ndarray, list, tuple)):
-        try:
-            return InferenceResponse(
-                id=generate_uuid(),
-                model_name=model_name,
-                outputs=[_enc("output_0", value)],
-            )
-        except Exception:
-            return None
-
-    # Dict[str, array-like] -> many outputs
-    if isinstance(value, dict):
-        try:
-            outputs = [_enc(str(k), v) for k, v in value.items()]
-            return InferenceResponse(
-                id=generate_uuid(),
-                model_name=model_name,
-                outputs=outputs,
-            )
-        except Exception:
-            return None
-
-    return None
 
 
 def _sync_iter_to_async(
@@ -292,10 +352,6 @@ def _sync_iter_to_async(
 ) -> AsyncIterator[Any]:
     """
     Bridge a synchronous iterator to an async generator using a background thread.
-
-    Ensures items are delivered into an asyncio.Queue with bounded prefetch,
-    and propagates any exception raised in the sync generator back to the
-    async consumer.
     """
     END = object()
     q: asyncio.Queue = asyncio.Queue(maxsize=max(prefetch, 1))
@@ -314,7 +370,9 @@ def _sync_iter_to_async(
         finally:
             loop.call_soon_threadsafe(q.put_nowait, END)
 
-    threading.Thread(target=_feeder, name="sync-stream-feeder", daemon=True).start()
+    threading.Thread(
+        target=_feeder, name="sync-stream-feeder", daemon=True
+    ).start()
 
     async def _agen() -> AsyncIterator[Any]:
         while True:
@@ -335,12 +393,6 @@ def _as_async_iter(
 ) -> AsyncIterator[Any]:
     """
     Normalize a value into an async iterator.
-
-    Supports:
-      - async generators and async iterables
-      - awaitables (await, then normalize the result)
-      - sync generators / iterators (bridged via a background thread)
-      - plain values (yield once)
     """
     if inspect.isasyncgen(value) or hasattr(value, "__aiter__"):
         return value  # type: ignore[return-value]
@@ -350,6 +402,7 @@ def _as_async_iter(
             inner = await value
             async for item in _as_async_iter(inner, loop, prefetch=prefetch):
                 yield item
+
         return _wrap()
 
     if inspect.isgenerator(value) or isinstance(value, Iterator):
@@ -357,6 +410,7 @@ def _as_async_iter(
 
     async def _single() -> AsyncIterator[Any]:
         yield value
+
     return _single()
 
 
@@ -370,7 +424,10 @@ def _as_outcome(obj: Any) -> _Outcome:
     if isinstance(obj, _Outcome):
         return obj
     msg = f"Unexpected outcome type: {type(obj).__name__}"
-    return _Outcome(id=getattr(obj, "id", _UNKNOWN), exception=WorkerError(RuntimeError(msg)))
+    return _Outcome(
+        id=getattr(obj, "id", _UNKNOWN),
+        exception=WorkerError(RuntimeError(msg)),
+    )
 
 
 def _inc_model_update(outcome: str, update_type: Any) -> None:
@@ -391,6 +448,7 @@ class _MetricTimer(AbstractContextManager):
     Times a request and records latency on exit. Also provides a one-time
     exception marker to increment the exceptions counter exactly once.
     """
+
     def __init__(self, model: str, method: str) -> None:
         self.model = model
         self.method = method
@@ -419,19 +477,22 @@ def _is_stop_signal(msg: object) -> bool:
     if msg is END_OF_QUEUE:
         return True
     # Compatibility: treat anonymous object() as a stop signal
-    return (msg.__class__ is object)
+    return msg.__class__ is object
 
 
 # -----------------------------------------------------------------------------
 # Worker
 # -----------------------------------------------------------------------------
 
+
 class Worker(Process):
-    """Isolated model executor running in a separate OS process."""
+    """Isolated model executor running in a separate OS process (strict mode)."""
 
     # ---------------------------- lifecycle ---------------------------------
 
-    def __init__(self, settings: Settings, responses: Queue, env: Optional[Environment] = None):
+    def __init__(
+        self, settings: "Settings", responses: Queue, env: Optional["Environment"] = None
+    ):
         """
         Initialize the worker process with internal request/update queues.
 
@@ -449,7 +510,7 @@ class Worker(Process):
         self.__executor: Optional[ThreadPoolExecutor] = None
         # Futures returned by run_in_executor for our MP->async bridges.
         self._bridge_futures: list = []
-        self._model_registry: Optional[MultiModelRegistry] = None
+        self._model_registry = None  # lazy; created after env is active
         self._active: bool = False
         # Map (request_id, channel_id) -> asyncio.Queue that feeds the model method.
         self._inbound_streams: dict[tuple[str, str], asyncio.Queue] = {}
@@ -464,15 +525,33 @@ class Worker(Process):
     def run(self) -> None:
         """
         Process entrypoint:
+          - Activate env context (if provided)
+          - Sanitize sys.version for strict platform parsers
           - Install uvloop
           - Configure logging and metrics
           - Enter the async main routine
         """
         ctx = self._env or nullcontext()
         with ctx:
+            # Belt-and-suspenders: make sys.version parseable before heavy imports
+            _sanitize_sys_version()
+
+            # Import mlserver bits *after* env is active
+            try:
+                from mlserver.utils import install_uvloop_event_loop
+            except Exception:
+                install_uvloop_event_loop = lambda: None  # type: ignore
+
             install_uvloop_event_loop()
             configure_logger(self._settings)
-            configure_metrics(self._settings)
+            try:
+                if _ENABLE_METRICS:
+                    from mlserver.metrics import configure_metrics
+                    configure_metrics(self._settings)
+            except Exception as e:
+                logger.warning(
+                    "Worker metrics disabled (configure_metrics failed): %s", e
+                )
             asyncio.run(self._coro_run())
 
     async def _coro_run(self) -> None:
@@ -494,7 +573,7 @@ class Worker(Process):
             # Ensure bridge threads finish while the loop is still alive
             for fut in list(self._bridge_futures):
                 with contextlib.suppress(Exception):
-                    await fut               # <- important
+                    await fut  # <- important
             self._bridge_futures.clear()
             # Tear down the dedicated executor used for the bridges
             self._executor.shutdown(wait=False, cancel_futures=True)
@@ -502,10 +581,7 @@ class Worker(Process):
     # ---------------------------- init helpers ------------------------------
 
     def _install_signal_ignores(self, loop: asyncio.AbstractEventLoop) -> None:
-        """
-        Register benign handlers for termination signals so we stay in control
-        of shutdown sequence.
-        """
+        """Register benign handlers for termination signals."""
         for sign in IGNORED_SIGNALS:
             try:
                 loop.add_signal_handler(sign, _noop)
@@ -515,6 +591,8 @@ class Worker(Process):
 
     def _init_runtime(self) -> None:
         """Create the model registry, mark active, and clear any residual streams."""
+        from mlserver.registry import MultiModelRegistry  # lazy
+
         self._model_registry = MultiModelRegistry()
         self._active = True
         self._inbound_streams.clear()
@@ -523,27 +601,10 @@ class Worker(Process):
         """
         Bridge a multiprocessing.Queue (blocking, cross-process) into an asyncio.Queue
         (non-blocking, loop-bound).
-
-        Why a bridge at all?
-        - multiprocessing.Queue blocks and isn’t awaitable.
-        - We read it in a background thread and hand off items to the event loop,
-        so async code downstream stays non-blocking.
         """
         loop = asyncio.get_running_loop()
 
         def safe_put(item) -> bool:
-            """
-            Schedule aq.put_nowait(item) on the event loop from a worker thread.
-
-            Why call_soon_threadsafe?
-            - It’s the supported way to poke the loop from another thread.
-
-            Why both loop.is_closed() and a RuntimeError guard?
-            - The loop can close at any moment during teardown. is_closed() avoids
-            most races, but the loop might still close between the check and the
-            call; catching RuntimeError covers that final window.
-            - Returning False tells the pump to exit quietly during shutdown.
-            """
             if loop.is_closed():
                 return False
             try:
@@ -553,17 +614,6 @@ class Worker(Process):
                 return False
 
         def pump() -> None:
-            """
-            Blocking reader that runs in a thread and forwards items into the loop.
-
-            Why exit on END_OF_QUEUE?
-            - It’s our explicit shutdown sentinel; forwarding it lets the async side
-            stop cleanly.
-
-            Why swallow EOFError/OSError?
-            - Those mean the other end of the mp queue disappeared (process exit /
-            teardown). Exiting quietly avoids noisy, misleading errors.
-            """
             while True:
                 try:
                     msg = mpq.get()
@@ -575,24 +625,15 @@ class Worker(Process):
                     return
 
                 if not safe_put(msg):
-                    # Loop is closing/closed; further deliveries would just error.
                     return
 
-        # Why run_in_executor instead of starting our own thread?
-        # - Reuses the worker’s ThreadPoolExecutor (fewer threads to manage).
-        # - Returns a Future bound to the loop, so stop() can await it and ensure
-        #   the bridge finishes before the loop is torn down.
         fut = loop.run_in_executor(self._executor, pump)
-        self._bridge_futures.append(fut)  # stop() will await these to quiesce bridges
-
+        self._bridge_futures.append(fut)
 
     # ------------------------------ loops -----------------------------------
 
     async def _requests_loop(self, req_async_q: asyncio.Queue) -> None:
-        """
-        Consume inbound request messages and dispatch to handlers until a stop
-        signal is received. Accepts both END_OF_QUEUE and a bare object() poison pill.
-        """
+        """Consume inbound request messages and dispatch to handlers."""
         while self._active:
             msg = await req_async_q.get()
 
@@ -601,21 +642,17 @@ class Worker(Process):
                 break
 
             if isinstance(msg, ModelRequestMessage):
-                schedule_with_callback(self._process_request(msg), self._finalize_and_enqueue)
+                _schedule_with_callback(
+                    self._process_request(msg), self._finalize_and_enqueue
+                )
                 continue
 
             if isinstance(msg, (ModelStreamInputChunk, ModelStreamInputEnd)):
                 self._handle_inbound_stream(msg)
                 continue
 
-            # Quiet during shutdown races
-            pass
-
     async def _updates_loop(self, upd_async_q: asyncio.Queue) -> None:
-        """
-        Consume inbound model update messages until a stop signal is received.
-        Accepts both END_OF_QUEUE and a bare object() poison pill.
-        """
+        """Consume inbound model update messages."""
         while self._active:
             upd = await upd_async_q.get()
 
@@ -623,14 +660,16 @@ class Worker(Process):
                 self._active = False
                 break
 
-            schedule_with_callback(self._process_model_update(upd), self._finalize_and_enqueue)
+            _schedule_with_callback(
+                self._process_model_update(upd), self._finalize_and_enqueue
+            )
 
     # --------------------------- inbound streams -----------------------------
 
-    def _handle_inbound_stream(self, msg: ModelStreamInputChunk | ModelStreamInputEnd) -> None:
-        """
-        Route client->server streaming input into the appropriate per-request queue.
-        """
+    def _handle_inbound_stream(
+        self, msg: ModelStreamInputChunk | ModelStreamInputEnd
+    ) -> None:
+        """Route client->server streaming input into the appropriate per-request queue."""
         key = (msg.id, getattr(msg, "channel_id", ""))
         q = self._inbound_streams.get(key)
         if q is None:
@@ -647,10 +686,7 @@ class Worker(Process):
     def _wrap_channels(
         self, request: ModelRequestMessage, args: list[Any], kwargs: dict[str, Any]
     ) -> tuple[list[Any], dict[str, Any]]:
-        """
-        Replace any InputChannelRef occurrences inside args/kwargs with async
-        iterators that read from the request-specific inbound queues.
-        """
+        """Replace any InputChannelRef occurrences inside args/kwargs with async iterators."""
 
         async def _aiter_from_async_q(q: asyncio.Queue) -> AsyncIterator[Any]:
             while True:
@@ -680,23 +716,27 @@ class Worker(Process):
     async def _invoke_method(self, request: ModelRequestMessage) -> _Outcome:
         """
         Resolve the target model and method, call it, and normalize the result.
-
-        Returns:
-            _Outcome with either:
-              - return_value (already awaited if it was a simple awaitable), or
-              - exception as WorkerError
         """
         assert self._model_registry is not None
         try:
-            model = await self._model_registry.get_model(request.model_name, request.model_version)
+            model = await self._model_registry.get_model(
+                request.model_name, request.model_version
+            )
             method = getattr(model, request.method_name)
-            args, kwargs = self._wrap_channels(request, list(request.method_args), dict(request.method_kwargs))
+            args, kwargs = self._wrap_channels(
+                request, list(request.method_args), dict(request.method_kwargs)
+            )
+            logger.debug("model.settings: %r", getattr(model, "settings", None))
+
+            from mlserver.context import model_context  # lazy
 
             with model_context(model.settings):
                 # Decode InferenceRequest -> typed args if needed
                 if _should_decode_request(method, args):
                     try:
-                        args, add_kwargs = _decode_request_args_for(method, args[0], model)  # type: ignore[arg-type]
+                        args, add_kwargs = _decode_request_args_for(
+                            method, args[0], model  # type: ignore[arg-type]
+                        )
                         kwargs.update(add_kwargs)
                     except Exception as e:
                         return _Outcome(id=request.id, exception=WorkerError(e))
@@ -720,19 +760,23 @@ class Worker(Process):
             # Hard failure resolving model/method or executing
             return _Outcome(id=request.id, exception=WorkerError(e))
 
-    async def _emit_stream(self, request_id: str, stream: AsyncIterator[Any], model: str, method: str) -> None:
-        """
-        Emit streaming chunks followed by a terminal end message, or an end+error on failure.
-        """
+    async def _emit_stream(
+        self, request_id: str, stream: AsyncIterator[Any], model: str, method: str
+    ) -> None:
+        """Emit streaming chunks followed by a terminal end message, or an end+error on failure."""
         try:
             async for chunk in stream:
-                self._responses.put(ModelStreamChunkMessage(id=request_id, chunk=chunk))
+                self._responses.put(
+                    ModelStreamChunkMessage(id=request_id, chunk=chunk)
+                )
                 _METRICS.stream_chunks_total.labels(model=model, method=method).inc()
             self._responses.put(ModelStreamEndMessage(id=request_id))
         except (Exception, CancelledError) as e:
             logger.exception("Streaming error in '%s' from model '%s'.", method, model)
             _METRICS.stream_errors_total.labels(model=model, method=method).inc()
-            self._responses.put(ModelStreamEndMessage(id=request_id, exception=WorkerError(e)))
+            self._responses.put(
+                ModelStreamEndMessage(id=request_id, exception=WorkerError(e))
+            )
 
     async def _handle_stream_or_value(
         self,
@@ -743,17 +787,35 @@ class Worker(Process):
     ) -> _Outcome:
         """
         If the method result is streaming-like, emit chunks and a terminal end;
-        otherwise, return the value directly (coercing plain returns for `predict`).
+        otherwise, return the value directly (strict contract for predict()).
         """
         if not _is_stream_like(result):
-            coerced = _coerce_to_inference_response(result, model_name, method_name)
-            return _Outcome(id=request.id, return_value=coerced if coerced is not None else result)
+            # STRICT: predict() must return an InferenceResponse (no silent coercion)
+            if method_name == "predict":
+                try:
+                    from mlserver.types import InferenceResponse  # lazy import
+                except Exception as e:
+                    return _Outcome(id=request.id, exception=WorkerError(e))
+
+                if not isinstance(result, InferenceResponse):
+                    return _Outcome(
+                        id=request.id,
+                        exception=WorkerError(
+                            TypeError(
+                                f"{model_name}.predict() must return InferenceResponse, "
+                                f"got {type(result).__name__}"
+                            )
+                        ),
+                    )
+            return _Outcome(id=request.id, return_value=result)
 
         loop = asyncio.get_running_loop()
         _METRICS.active_streams.inc()
         try:
             stream_iter = _as_async_iter(result, loop=loop, prefetch=4)
-            await self._emit_stream(request.id, stream_iter, model_name, method_name)
+            await self._emit_stream(
+                request.id, stream_iter, model_name, method_name
+            )
             return _Outcome(id=request.id, return_value=None)
         finally:
             self._clean_request_streams(request.id)
@@ -763,12 +825,7 @@ class Worker(Process):
 
     async def _process_request(self, request: ModelRequestMessage) -> _Outcome:
         """
-        Main handler for model requests:
-            1) increment request counter,
-            2) time end-to-end latency,
-            3) invoke the target method,
-            4) stream or return the result accordingly,
-            5) mark exceptions exactly once.
+        Main handler for model requests with metrics & error normalization.
         """
         model_name, method_name = _labels_from_request(request)
         _METRICS.requests_total.labels(model=model_name, method=method_name).inc()
@@ -777,9 +834,13 @@ class Worker(Process):
             try:
                 invocation = await self._invoke_method(request)
                 if invocation.exception is not None:
+                    mt.mark_exception()
                     return invocation
                 return await self._handle_stream_or_value(
-                    request, invocation.return_value, model_name, method_name
+                    request,
+                    invocation.return_value,
+                    model_name,
+                    method_name,
                 )
             except Exception as e:
                 mt.mark_exception()
@@ -788,13 +849,11 @@ class Worker(Process):
 
     async def _process_model_update(self, update: ModelUpdateMessage | Any) -> _Outcome:
         """
-        Apply a model update (load/unload). Always returns an _Outcome to settle
-        the parent future, whether success or error.
+        Apply a model update (load/unload). Always returns an _Outcome.
         """
         assert self._model_registry is not None
         try:
             if not isinstance(update, ModelUpdateMessage):
-                # keep quiet about content; just surface a single WorkerError
                 _inc_model_update("error", getattr(update, "update_type", _UNKNOWN))
                 return _Outcome(
                     id=getattr(update, "id", _UNKNOWN),
@@ -809,22 +868,23 @@ class Worker(Process):
                 await self._model_registry.unload_version(ms.name, ms.version)
                 _inc_model_update("success", update.update_type)
             else:
-                logger.warning("Unknown model update message with type %s", update.update_type)
+                logger.warning(
+                    "Unknown model update message with type %s", update.update_type
+                )
                 _inc_model_update("unknown", update.update_type)
 
             return _Outcome(id=update.id)
 
         except (Exception, CancelledError) as e:
             _inc_model_update("error", getattr(update, "update_type", _UNKNOWN))
-            return _Outcome(id=getattr(update, "id", _UNKNOWN), exception=WorkerError(e))
+            return _Outcome(
+                id=getattr(update, "id", _UNKNOWN), exception=WorkerError(e)
+            )
 
     # ------------------------ single return/enqueue --------------------------
 
     def _finalize_and_enqueue(self, task: Task) -> None:
-        """
-        Turn an internal _Outcome into a ModelResponseMessage and enqueue it.
-        This is the only place that communicates back to the parent process.
-        """
+        """Turn an internal _Outcome into a ModelResponseMessage and enqueue it."""
         try:
             outcome = task.result()
         except Exception as e:
@@ -833,9 +893,7 @@ class Worker(Process):
 
         outcome = _as_outcome(outcome)
         response = ModelResponseMessage(
-            id=outcome.id,
-            return_value=outcome.return_value,
-            exception=outcome.exception,
+            id=outcome.id, return_value=outcome.return_value, exception=outcome.exception
         )
 
         try:

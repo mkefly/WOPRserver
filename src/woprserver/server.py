@@ -12,7 +12,7 @@ from mlserver.metrics import MetricsServer
 from mlserver.kafka import KafkaServer
 from mlserver.server import MLServer
 from .logging import configure_logger
-from .parallel import InferencePoolRegistry
+from .parallel.registry import InferencePoolRegistry
 from .rest.server import WRESTServer
 from .grpc.server import GRPCServer
 

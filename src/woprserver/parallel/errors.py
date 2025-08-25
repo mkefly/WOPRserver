@@ -3,6 +3,11 @@ from mlserver.errors import MLServerError
 from mlserver.model import MLModel
 
 
+class MLServerError(Exception):
+    def __init__(self, msg: str, status_code: int = status.HTTP_400_BAD_REQUEST):
+        super().__init__(msg)
+        self.status_code = status_code
+
 class EnvironmentNotFound(MLServerError):
     def __init__(self, model: MLModel, env_hash: str):
         msg = (

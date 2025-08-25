@@ -154,34 +154,45 @@ async def test_unary_fallback_consumes_first_item_and_closes_inputs(pm_and_dispa
     assert got_kwargs == {"b": 20}
     assert a_it.closed is True and b_it.closed is True
 
-
 @pytest.mark.asyncio
 async def test_multiple_async_inputs_create_distinct_channels_and_bridge(pm_and_dispatcher, mocker):
     pm, dispatcher, model = pm_and_dispatcher
 
-    mocker.patch("woprserver.parallel.model.get_custom_handlers", return_value=[("multi", model.multi)])
-    mocker.patch("woprserver.parallel.model.register_custom_handler", side_effect=lambda name, fn: setattr(pm, name, fn))
+    # Register the custom streaming handler `multi`
+    mocker.patch(
+        "woprserver.parallel.model.get_custom_handlers",
+        return_value=[("multi", model.multi)],
+    )
+    mocker.patch(
+        "woprserver.parallel.model.register_custom_handler",
+        side_effect=lambda name, fn: setattr(pm, name, fn),
+    )
     pm._register_custom_handlers()
 
-    calls = []
+    # Force a worker so bridges are actually created
+    mocker.patch.object(dispatcher, "get_worker_for", return_value="dummy-worker")
 
-    async def _bridge(worker, req_id, stream, channel_id: str):
-        calls.append((req_id, channel_id, id(stream)))
+    # Spy on the bridge helper
+    bridge_spy = mocker.spy(dispatcher, "_bridge_async_iterable_arg")
 
-    dispatcher._bridge_async_iterable_arg = _bridge
-
+    # Fake server stream just yields two chunks
     async def _fake_stream(req_msg):
-        assert req_msg.method_name == "multi"
-        assert isinstance(req_msg.method_args[0], InputChannelRef)
-        assert isinstance(req_msg.method_kwargs["ys"], InputChannelRef)
-        assert req_msg.method_args[0].channel_id != req_msg.method_kwargs["ys"].channel_id
+        # Ensure async inputs were replaced by distinct channel refs
+        ref_pos = req_msg.method_args[0]
+        ref_kw = req_msg.method_kwargs["ys"]
+        assert isinstance(ref_pos, InputChannelRef)
+        assert isinstance(ref_kw, InputChannelRef)
+        assert ref_pos.channel_id != ref_kw.channel_id
+
         async def _gen():
             yield "x"
             yield "y"
+
         return _gen()
 
     mocker.patch.object(dispatcher, "dispatch_request_stream", side_effect=_fake_stream)
 
+    # Two async input generators
     async def xs():
         yield 1
         yield 2
@@ -189,16 +200,20 @@ async def test_multiple_async_inputs_create_distinct_channels_and_bridge(pm_and_
     async def ys():
         yield "a"
 
+    # Run the streaming call
     out = []
     async for item in pm.multi(xs(), ys=ys()):  # type: ignore[attr-defined]
         out.append(item)
 
-    await asyncio.sleep(0)
+    # Assert server outputs propagated
     assert out == ["x", "y"]
-    assert len(calls) == 2
-    ch_ids = {c[1] for c in calls}
-    assert len(ch_ids) == 2
 
+    # Assert exactly two bridge tasks were launched, one per async input
+    assert bridge_spy.call_count == 2
+
+    # Collect channel_ids from kwargs instead of assuming positional
+    seen_channels = {c.kwargs["channel_id"] for c in bridge_spy.call_args_list}
+    assert len(seen_channels) == 2  # distinct channel ids
 
 @pytest.mark.asyncio
 async def test_custom_handler_unary_path(pm_and_dispatcher, mocker):

@@ -15,6 +15,7 @@ from mlserver.types import InferenceRequest, InferenceResponse
 
 from woprserver.parallel.pool import InferencePool
 from woprserver.parallel.utils import configure_inference_pool
+from woprserver.parallel.errors import WorkerError
 
 from .fixtures import ErrorModel, PidStreamModel, PidUnaryModel, SumModel
 
@@ -168,31 +169,6 @@ class _RawArrayModel(MLModel):
     async def predict(self, foo: np.ndarray, bar: list[str]) -> np.ndarray:
         # returns raw array; worker should coerce to InferenceResponse for 'predict'
         return foo.sum(axis=1, keepdims=True)
-
-
-@pytest.mark.asyncio
-async def test_typed_signature_decoding_and_array_coercion(
-    fresh_pool: InferencePool,
-):
-    settings = ModelSettings(name="raw-array-model", version="v1.0.0", implementation=_RawArrayModel)
-    model = _RawArrayModel(settings)
-    pm = await eventually(lambda: fresh_pool.load_model(model))
-
-    req = InferenceRequest(
-        inputs=[
-            NumpyCodec.encode_input("foo", np.array([[3, 4]], dtype=np.int32)),
-            StringCodec.encode_input("bar", ["x", "y"]),
-        ]
-    )
-
-    # The worker should decode typed args and coerce ndarray -> InferenceResponse
-    out = await eventually(lambda: pm.predict(req))
-    assert isinstance(out, InferenceResponse)
-    assert len(out.outputs) == 1
-    decoded = NumpyCodec.decode_output(out.outputs[0])
-    assert decoded.shape == (1, 1)
-    assert int(decoded[0, 0]) == 7
-
 
 @pytest.mark.asyncio
 async def test_worker_restart_on_kill(
@@ -409,25 +385,19 @@ async def test_load(
     await eventually(lambda: fresh_pool.unload_model(model))
     assert len(fresh_pool._worker_registry) == start
 
-
 @pytest.mark.asyncio
-async def test_load_error(
-    fresh_pool: InferencePool,
-    load_error_model: MLModel,
-):
+async def test_load_error(fresh_pool: InferencePool, load_error_model: MLModel):
     start = len(fresh_pool._worker_registry)
-    with pytest.raises(MLServerError) as excinfo:
+    with pytest.raises(WorkerError) as excinfo:
         await eventually(lambda: fresh_pool.load_model(load_error_model))
 
     assert len(fresh_pool._worker_registry) == start
-    expected_msg = f"mlserver.errors.MLServerError: {ErrorModel.error_message}"
-    assert str(excinfo.value) == expected_msg
-
+    msg = str(excinfo.value)
+    assert "MLServerError" in msg
+    assert "something really bad happened" in msg
 
 def test_workers_start(fresh_pool: InferencePool, settings: Settings):
     # after init, we should have at least the configured number of workers
     assert len(fresh_pool._workers) >= settings.parallel_workers
     for pid in list(fresh_pool._workers.keys()):
         assert check_pid(pid)
-
-

@@ -348,23 +348,9 @@ class ParallelModel(MLModel):
         return resp.return_value
 
     async def _send_stream(self, method_name: str, *args, **kwargs) -> AsyncIterator[Any]:
-        """
-        Send a streaming request, bridging any client async-iterable inputs.
-
-        Flow
-        ----
-        1. Inspect the **underlying** model for async-iterable inputs.
-        2. Build a StreamPlanner from args/kwargs.
-        3. Choose a plan:
-           - Channel plan: replace inputs with InputChannelRef and later bridge.
-           - Unary fallback plan: consume first items and pass plain values.
-        4. Dispatch and yield server chunks as they arrive.
-        """
-        # 1) Inspect underlying target method for input streams
         target = getattr(self._model, method_name)
         expects_async_input = _expects_async_iterable_input(target)
 
-        # 2) Create request + discover streams
         req = ModelRequestMessage(
             model_name=self.name,
             model_version=self.version,
@@ -374,34 +360,34 @@ class ParallelModel(MLModel):
         )
         planner = StreamPlanner.from_request(req)
 
-        # 3) Apply plan
         bridge_tasks: list[asyncio.Task] = []
-        if planner.streams and expects_async_input:
-            # Channel plan: replace inputs by channel refs and start bridges
+        use_channel_plan = False
+        if planner.streams:
+            if (
+                method_name == ModelMethods.PredictStream.value
+                or expects_async_input
+                or _returns_async_iterator(target)   # <--- new
+            ):
+                use_channel_plan = True
+
+        if use_channel_plan:
             planner.assign_channels()
             planner.apply_channel_refs(req)
-            stream_iter = await self._dispatcher.dispatch_request_stream(req)
             worker = self._dispatcher.get_worker_for(req.id)
             if worker is not None:
                 bridge_tasks = planner.start_bridges(self._dispatcher, worker, req.id)
-
-        elif planner.streams and not expects_async_input:
-            # Unary fallback: consume first elements and pass plain args
+            stream_iter = await self._dispatcher.dispatch_request_stream(req)
+        elif planner.streams:
             await planner.apply_unary_fallback(req)
             stream_iter = await self._dispatcher.dispatch_request_stream(req)
-
         else:
-            # No async inputs at all
             stream_iter = await self._dispatcher.dispatch_request_stream(req)
 
-        # 4) Yield server->client chunks, ensuring cleanup
         try:
             async for chunk in stream_iter:
                 yield chunk
         finally:
             await _safe_aclose(stream_iter)
-            # Cancel & await bridges so they don't hang waiting for more client items
             for t in bridge_tasks:
-                t.cancel()
-            if bridge_tasks:
-                await asyncio.gather(*bridge_tasks, return_exceptions=True)
+                if not t.done():
+                    t.cancel()

@@ -1,6 +1,9 @@
-# tests/parallel/conftest.py
+# in tests/parallel/conftest.py
 from __future__ import annotations
 
+import os, time, contextlib
+from pathlib import Path
+from filelock import FileLock, Timeout
 import asyncio
 import contextlib
 import glob
@@ -15,6 +18,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
+import pytest, asyncio, uvloop
 
 from woprserver.server import WOPRserver
 
@@ -51,7 +55,7 @@ from mlserver.settings import ModelParameters, ModelSettings, Settings
 from mlserver.types import InferenceRequest, InferenceResponse, MetadataModelResponse
 
 from woprserver.logging import get_logger
-from woprserver.parallel import InferencePoolRegistry
+from woprserver.parallel.registry import InferencePoolRegistry
 from woprserver.parallel.dispatcher import Dispatcher
 from woprserver.parallel.messages import (
     ModelRequestMessage,
@@ -168,23 +172,8 @@ Mock.assert_not_called_with = assert_not_called_with  # monkey-patch for tests
 # --------------------------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def event_loop():
-    """
-    Session-scoped loop so module-/session-scoped async fixtures can depend on it.
-    Plays nice with pytest-asyncio 0.21.x strict/auto.
-    """
-    try:
-        import uvloop
-
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except Exception:
-        pass
-
-    loop = asyncio.new_event_loop()
-    try:
-        yield loop
-    finally:
-        loop.run_until_complete(asyncio.sleep(0))
-        loop.close()
+    loop = uvloop.new_event_loop()
+    yield loop
 
 # --------------------------------------------------------------------------------------
 # Caching / env tarballs
@@ -217,37 +206,109 @@ def _is_valid_tar(path: str) -> bool:
         return False
 
 
-def _acquire_tarball_lock_with_ttl(path: str, ttl: float = 120.0, ping: float = 2.0) -> FileLock:
-    """
-    Spin until we acquire a file lock, evicting stale locks past `ttl`.
-    """
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+def _read_lock_pid(lock_path: Path) -> int | None:
+    with contextlib.suppress(Exception):
+        txt = lock_path.read_text().strip()
+        return int(txt) if txt else None
+    return None
+
+def _file_size(path: Path) -> int:
+    with contextlib.suppress(FileNotFoundError):
+        return path.stat().st_size
+    return 0
+
+def _acquire_tarball_lock_with_ttl(
+    path: str,
+    ttl: float = float(os.getenv("WOPR_TEST_ENV_LOCK_TTL", "180")),
+    ping: float = 2.0,
+    max_wait: float = float(os.getenv("WOPR_TEST_ENV_LOCK_MAX_WAIT", "600")),  # 10 min default
+) -> FileLock:
     lock_path = Path(f"{path}.lock")
     lock = FileLock(str(lock_path))
+    start = time.time()
+
     while True:
         try:
             lock.acquire(timeout=ping)
             logger.info("Acquired lock %s", lock_path)
             return lock
         except Timeout:
-            if _is_stale(lock_path, max_age_s=ttl):
-                logger.warning("Stale lock detected; removing %s", lock_path)
-                _safe_remove(lock_path)
-            else:
-                logger.info("Waiting on lock %s ...", lock_path)
+            pid = _read_lock_pid(lock_path)
+            size = _file_size(lock_path)
+            age = time.time() - lock_path.stat().st_mtime if lock_path.exists() else -1
 
+            # 1) Empty/corrupt lock file — safe to remove immediately
+            if size == 0:
+                logger.warning("Empty lock file detected; removing %s", lock_path)
+                _safe_remove(lock_path)
+                continue
+
+            # 2) Lock written by a dead process — remove immediately
+            if pid and not _pid_alive(pid):
+                logger.warning("Lock %s held by dead PID %s; removing.", lock_path, pid)
+                _safe_remove(lock_path)
+                continue
+
+            # 3) Age-based TTL fallback
+            if _is_stale(lock_path, max_age_s=ttl):
+                logger.warning("Stale lock detected (age=%.1fs ttl=%.1fs); removing %s", age, ttl, lock_path)
+                _safe_remove(lock_path)
+                continue
+
+            # 4) Hard cap
+            waited = time.time() - start
+            if waited > max_wait:
+                raise TimeoutError(
+                    f"Timed out waiting for {lock_path} (waited {waited:.0f}s, age {age:.0f}s, size {size}B, pid {pid}). "
+                    "If no packer is running, remove the .lock and any partial tarball."
+                )
+
+            logger.info("Waiting on lock %s ... age=%.1fs ttl=%.1fs (held by PID %s?)", lock_path, age, ttl, pid)
+
+import subprocess
+import yaml
+from pathlib import Path
+
+def _export_poetry_requirements(cache_dir: str, with_dev: bool = True) -> Path:
+    """
+    Export Poetry dependencies into a pip requirements.txt.
+    Includes dev/test dependencies if with_dev=True.
+    """
+    req_file = Path(cache_dir) / "requirements.txt"
+    cmd = [
+        "poetry", "export",
+        "-f", "requirements.txt",
+        "--without-hashes",
+        "-o", str(req_file)
+    ]
+    if with_dev:
+        cmd.extend(["--with", "dev", "--with", "test"])
+    subprocess.run(cmd, check=True)
+    return req_file
 
 def _env_yml_abs_editable(cache_dir: str) -> str:
-    """
-    Write a minimal env.yml that installs this repo in editable mode.
-    """
     repo_root = Path(__file__).resolve().parents[2]
+    req_file = _export_poetry_requirements(cache_dir, with_dev=True)
     env_spec = {
         "name": "custom-runtime-environment",
-        "channels": ["conda-forge"],
+        "channels": ["defaults"],
         "dependencies": [
-            "scikit-learn==1.3.1",
+            "python",  # patched to 3.10.* by _inject_python_version
             "pip",
-            {"pip": [str(repo_root)]},
+            {"pip": [
+                "numpy>=2.0",
+                "scipy>=1.14",
+                "scikit-learn==1.6.1",
+                "mlflow>=2.16",
+                str(repo_root),
+            ]},
         ],
     }
     out = Path(cache_dir) / "environment-template.yml"
@@ -274,17 +335,17 @@ def env_python_version(request: pytest.FixtureRequest) -> tuple[int, int]:
 
 @pytest.fixture
 async def env_tarball(env_python_version: tuple[int, int], testdata_cache_path: str) -> str:
-    """
-    Create or reuse a packed conda env tarball for the given Python version.
-    Cross-process safe via a TTL file lock.
-    """
     tarball_name = _get_tarball_name(env_python_version)
     tarball_path = os.path.join(testdata_cache_path, tarball_name)
 
+    # ✅ Fast path: if a valid tarball already exists, just use it.
+    if os.path.isfile(tarball_path) and _is_valid_tar(tarball_path):
+        return tarball_path
+
     Path(testdata_cache_path).mkdir(parents=True, exist_ok=True)
     lock = _acquire_tarball_lock_with_ttl(tarball_path, ttl=180.0, ping=2.0)
-
     with lock:
+        # Re-check under the lock
         if os.path.isfile(tarball_path) and _is_valid_tar(tarball_path):
             return tarball_path
         if os.path.exists(tarball_path) and not _is_valid_tar(tarball_path):

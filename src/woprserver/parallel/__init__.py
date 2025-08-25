@@ -1,5 +1,1 @@
-from .registry import InferencePoolRegistry
-from .utils import configure_inference_pool
-from .worker import Worker
-
-__all__ = ["InferencePoolRegistry", "Worker", "configure_inference_pool"]
+__all__ = []  # keep package import cheap for 'spawn'

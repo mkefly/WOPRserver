@@ -29,6 +29,8 @@ langchain = "^0.3.27"
 mlserver-sklearn = "^1.7.1"
 mlflow = "^3.2.0"
 mlserver-mlflow = "^1.7.1"
+pydantic = ">=2.7,<3.0"
+pydantic-settings = ">=2.2,<3.0"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -80,6 +82,7 @@ locust = "^2.38.1"
 protobuf = "^6.32.0"
 requests = "^2.32.5"
 sseclient-py = "^1.8.0"
+
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"
